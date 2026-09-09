@@ -41,6 +41,31 @@ Verified end-to-end: `autolib cdp engine -> Example Domain | webdriver: False`.
 - NOT overwritten: `autoclaw_autologin.py` (local delegates to autolib — newer than repo's direct-cloakbrowser version), `stealth_login.py` (local-only), `proxy.py`/`auth.py`/`login.py` (identical)
 - `autoclaw-proxy.service` restarted; `:31000` healthy; token store still **0 accounts** (login still requires interactive Google OAuth — unchanged blocker for :31000 chat)
 
+## 2026-09-10 addendum — puppeteer verification + two upstream bugs fixed locally
+
+The initial install only verified playwright. Follow-up verified **puppeteer** too
+(`puppeteer-core` via `puppeteer.connect({browserURL: 'http://127.0.0.1:9222'})`),
+which exposed two real upstream bugs — both fixed locally:
+
+1. **Heartbeat sends raw `ping` text frame to clients** (`src/websocket_manager.ts`)
+   — puppeteer parses every text frame as JSON and crashes (`"ping" is not valid JSON`).
+   Fix: reap dead sockets only, never inject non-JSON frames into the CDP stream.
+
+2. **`cleanup()` called `socketToSession.clear()`** — any single client disconnect
+   wiped ALL sessions' client→session routing. Fixed to delete only the
+   disconnecting session's sockets.
+
+**Known upstream limitation (documented, NOT locally patched):** after one client
+session completes, a second client session in the same service lifetime can wedge
+navigation responses (`Cannot send message (Client socket not ready (state: 3))`):
+each client gets its own Chrome WebSocket while target events broadcast across
+sessions, and response routing tracks only the newest state. This needs an
+upstream session-lifecycle redesign. Mitigation: `sudo systemctl restart
+cdp-proxy-interceptor` between batch runs.
+
+Runnable examples: `~/aiworkspace/cdp-proxy-interceptor/examples/`
+(`puppeteer-connect.mjs` + `README.md` with both client patterns).
+
 ## Usage
 
 ```bash
