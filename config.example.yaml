@@ -1,0 +1,70 @@
+# freebuff-unified example configuration.
+# Copy to config.yaml and fill in real values. Secrets belong in the
+# environment (see PARALLEL_API_KEY handling) — do not commit config.yaml.
+
+server:
+  listen: ":18080"
+  # First key is also used as the ProxyAPIKey for client auth (Bearer or x-api-key).
+  api_keys:
+    - "fbu_CHANGE_ME_client_key_1"
+    - "fbu_CHANGE_ME_client_key_2"
+
+upstream:
+  base_url: "https://www.codebuff.com"
+  cost_mode: "free"
+  default_model: "deepseek/deepseek-v4-pro"
+
+auth:
+  # Auth-gate keys (client-facing). Keep in sync with server.api_keys or
+  # migrate to a single block — see planning/2026-09-09-unification-audit.md.
+  api_keys:
+    - "fbu_CHANGE_ME_client_key_1"
+    - "fbu_CHANGE_ME_client_key_2"
+  dir: "auths"
+  breaker:
+    threshold: 3
+    cooldown: 12h
+
+stealth:
+  strip_headers: true
+  enabled: true
+  auto_refresh_pool: true
+  proxy_refresh_mins: 30
+  max_pool_proxies: 12
+  profile: "chrome120"
+  # US SOCKS5 egress pool (round-robin). Generate candidates with
+  # scripts/fetch-proxies.sh and validate with scripts/test-proxies.sh.
+  us_proxies:
+    - "socks5://REPLACE_ME_HOST_1:1080"
+    - "socks5://REPLACE_ME_HOST_2:1080"
+
+limits:
+  global_rpm: 120
+  account_rpm: 30
+  client_rpm: 60
+
+# Front-door passthrough — HEALTH REPORTING ONLY (not wired; see README).
+# proxy.enabled/backend_url feed /healthz and /ai-stack/status fields.
+proxy:
+  enabled: true
+  backend_url: "http://127.0.0.1:3457"
+
+dashboard:
+  enabled: true
+  addr: "127.0.0.1:9091"   # bind loopback unless you gate it behind auth
+  prefix: "/dashboard"
+
+# Hermes stealth sidecar (vendored under deps/hermes, served by
+# deps/hermes-service/service.js on :3101).
+hermes:
+  enabled: true
+  base_url: "http://127.0.0.1:3101"
+
+parallel:
+  enabled: true
+  base_url: "https://api.parallel.ai"
+  default_mode: "fast"
+  # api_key: read from PARALLEL_API_KEY env when omitted
+
+logging:
+  level: "info"

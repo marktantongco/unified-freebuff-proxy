@@ -1,0 +1,17 @@
+[Unit]
+Description=Hermes Stealth Sidecar (@kori_xyz/hermes over HTTP for freebuff-unified)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/x3/freebuff-unified/deps/hermes-service
+ExecStart=/usr/bin/node /home/x3/freebuff-unified/deps/hermes-service/service.js
+Environment=HERMES_SIDECAR_HOST=127.0.0.1
+Environment=HERMES_SIDECAR_PORT=3101
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,674 @@
+// Command freebuff-unified is the unified Freebuff gateway: it merges the
+// freebuff-proxy layer (OAuth credentials, stealth transport, dashboard) with
+// the Freebuff2API passthrough layer (proxy backends) and the ai-stack status
+// surface.
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/joho/godotenv"
+
+	"freebuff-unified/internal/config"
+	"freebuff-unified/internal/credentials"
+	"freebuff-unified/internal/dashboard"
+	"freebuff-unified/internal/freebuff"
+	"freebuff-unified/internal/hermes"
+	"freebuff-unified/internal/httpapi"
+	"freebuff-unified/internal/oauth"
+	"freebuff-unified/internal/parallel"
+	"freebuff-unified/internal/session"
+	"freebuff-unified/internal/stealth"
+	"freebuff-unified/internal/websearch"
+)
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+func main() {
+	logger := log.New(os.Stdout, "[freebuff-unified] ", log.LstdFlags|log.Lmicroseconds)
+
+	// Load optional .env file (freebuff-proxy style).
+	_ = godotenv.Load()
+
+	var configPath string
+	flag.StringVar(&configPath, "config", "config.yaml", "path to config file")
+	flag.Parse()
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		logger.Fatalf("load config: %v", err)
+	}
+
+	// Commands: serve (default), login, logout, check.
+	args := flag.Args()
+	if len(args) > 0 {
+		switch args[0] {
+		case "serve":
+			// fall through to normal startup
+		case "check":
+			runCheck(cfg, configPath)
+			return
+		case "login":
+			if err := runLogin(cfg); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		case "logout":
+			if err := runLogout(cfg); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command: %s\nusage: freebuff-unified [serve|login|logout|check]\n", args[0])
+			os.Exit(1)
+		}
+	}
+
+	runServe(cfg, logger)
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+func runCheck(cfg *config.Config, configPath string) {
+	fmt.Printf("config:    %s\n", configPath)
+	fmt.Printf("listen:    %s\n", cfg.Server.ListenAddr)
+	fmt.Printf("auth:      keys=%d breaker=%d/%s\n",
+		len(cfg.Auth.APIKeys), cfg.Auth.Breaker.Threshold, cfg.Auth.Breaker.Cooldown)
+	fmt.Printf("upstream:  %s (default=%s)\n", cfg.Upstream.BaseURL, cfg.Upstream.DefaultModel)
+	fmt.Printf("proxy:     enabled=%v backend=%s\n", cfg.Proxy.Enabled, cfg.Proxy.BackendURL)
+	fmt.Printf("stealth:   enabled=%v profile=%s us_proxies=%d strip_headers=%v\n",
+		cfg.Stealth.Enabled, cfg.Stealth.Profile, len(cfg.Stealth.USProxies), cfg.Stealth.StripHeaders)
+	fmt.Printf("limits:    global_rpm=%d\n", cfg.Limits.GlobalRPM)
+	fmt.Printf("dashboard: enabled=%v addr=%s\n", cfg.Dashboard.Enabled, cfg.Dashboard.Addr)
+	fmt.Printf("parallel:   enabled=%v mode=%s key=%s\n",
+		cfg.Parallel.Enabled, cfg.Parallel.DefaultMode, keySet(cfg.Parallel.APIKey))
+}
+
+func runLogin(cfg *config.Config) error {
+	ctx := context.Background()
+	flow := newOAuthFlow(cfg)
+	store := credentials.FileStore{Path: credentialsPath(cfg)}
+
+	code, err := flow.RequestLoginCode(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stdout, "Open this URL to log in:\n  %s\nWaiting for authentication (expires: %s)...\n",
+		code.LoginURL, code.ExpiresAt)
+
+	cred, err := flow.PollLoginStatus(ctx, code)
+	if err != nil {
+		return err
+	}
+	if err := store.Save(ctx, cred); err != nil {
+		return fmt.Errorf("save credentials: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "Logged in as %s <%s>.\nCredentials saved to %s.\n",
+		cred.Name, cred.Email, store.Path)
+	return nil
+}
+
+func runLogout(cfg *config.Config) error {
+	ctx := context.Background()
+	flow := newOAuthFlow(cfg)
+	store := credentials.FileStore{Path: credentialsPath(cfg)}
+
+	if err := flow.Logout(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: remote logout failed: %v\n", err)
+	}
+	if err := store.Clear(ctx); err != nil {
+		return fmt.Errorf("clear local credentials: %w", err)
+	}
+	fmt.Fprintln(os.Stdout, "Logged out. Local credential state cleared.")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Serve
+// ---------------------------------------------------------------------------
+
+func runServe(cfg *config.Config, logger *log.Logger) {
+	// ── Credentials store (freebuff-proxy file store) ──────────────────────
+	credsStore := credentials.FileStore{Path: credentialsPath(cfg)}
+
+	// Stealth observability (nil until stealth mode attaches its transport).
+	var stealthMetrics *stealth.Metrics
+
+	// ── Upstream client (Freebuff2API / freebuff-proxy upstream layer) ─────
+	baseURL := cfg.Upstream.BaseURL
+	if baseURL == "" {
+		baseURL = "https://codebuff.com"
+	}
+
+	var chatService httpapi.ChatService
+	var sessMgr *session.Manager
+	upstreamClient, upstreamErr := freebuff.NewClient(baseURL, nil)
+	if upstreamErr != nil {
+		logger.Printf("upstream client: %v (chat endpoints will return 503)", upstreamErr)
+	} else {
+		sessMgr = session.NewManager(credsStore, upstreamClient, "freebuff-unified")
+		// Pre-warm default model session 5s after boot so first query skips queue.
+		if cfg.Upstream.DefaultModel != "" {
+			sessMgr.Prewarm(context.Background(), cfg.Upstream.DefaultModel)
+		}
+		chatService = httpapi.FreebuffChatService{
+			Store:    credsStore,
+			Sessions: sessMgr,
+			Upstream: upstreamClient,
+		}
+	}
+
+	// ── US SOCKS5 proxy pool (freebuff-unified) ────────────────────────────
+	var usProxyPool *stealth.USProxyPool
+	if len(cfg.Stealth.USProxies) > 0 {
+		usProxyPool = stealth.NewUSProxyPool(cfg.Stealth.USProxies, logger)
+	}
+
+	// ── Dashboard (freebuff-proxy dashboard) ───────────────────────────────
+	if cfg.Dashboard.Enabled {
+		startDashboard(cfg.Dashboard, logger)
+	}
+
+	// Hermes stealth sidecar client (kori-lab/hermes vendored).
+	var hermesClient *hermes.Client
+	if cfg.Hermes.Enabled {
+		if cfg.Stealth.Enabled {
+			// Stealth mode needs headroom for long LLM completions relayed
+			// through the sidecar (sidecar caps 280s for codebuff upstream).
+			hermesClient = hermes.NewWithTimeout(cfg.Hermes.BaseURL, stealthUpstreamClientTimeout)
+		} else {
+			hermesClient = hermes.New(cfg.Hermes.BaseURL)
+		}
+		// Non-blocking health check: don't stall boot 60s if sidecar is down.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if h, err := hermesClient.Health(ctx); err != nil {
+				logger.Printf("hermes sidecar at %s: %v (stealth proxy endpoints will 503)", cfg.Hermes.BaseURL, err)
+			} else {
+				logger.Printf("hermes sidecar ok: %s on %s (sessions=%d)", h.Hermes, h.Node, h.Sessions)
+			}
+		}()
+	}
+
+	// ── Stealth mode toggle (cfg.Stealth.Enabled) ──────────────────────────
+	// Route non-streaming codebuff upstream calls through the hermes sidecar
+	// (browser-like TLS 1.3 / HTTP2 fingerprint + rotating SOCKS5 egress).
+	// SSE streaming bypasses the sidecar via the fallback transport.
+	if cfg.Stealth.Enabled && hermesClient != nil && upstreamErr == nil && upstreamClient != nil {
+		stealthMetrics = stealth.NewMetrics()
+		fallback := http.DefaultTransport.(*http.Transport).Clone()
+		fallback.ResponseHeaderTimeout = 60 * time.Second
+		upstreamClient.UseTransport(&http.Client{
+			Transport: &stealth.HermesRoundTripper{
+				Sidecar:   hermesClient,
+				Fallback:  fallback,
+				HTTP2:     true,
+				FailOpen:  true,
+				TimeoutMS: stealthUpstreamTimeoutMS,
+				Metrics:   stealthMetrics,
+				Proxy: func(*http.Request) string {
+					if usProxyPool == nil {
+						return ""
+					}
+					if p := usProxyPool.Next(); p != nil {
+						return p.String()
+					}
+					return ""
+				},
+			},
+		})
+		proxies := 0
+		if usProxyPool != nil {
+			proxies = usProxyPool.Size()
+		}
+		logger.Printf("stealth mode ON: upstream %s via hermes sidecar %s (socks5 pool: %d, failopen: on, sse: bypass)",
+			baseURL, cfg.Hermes.BaseURL, proxies)
+	}
+
+	// ── Parallel Web APIs client (search/extract) ───────────────────────
+	parallelAPIKey := cfg.Parallel.APIKey
+	if parallelAPIKey == "" {
+		parallelAPIKey = os.Getenv("PARALLEL_API_KEY")
+	}
+	var parallelClient *parallel.Client
+	if cfg.Parallel.Enabled && parallelAPIKey != "" {
+		parallelClient = parallel.New(cfg.Parallel.BaseURL, parallelAPIKey)
+		logger.Printf("parallel web APIs enabled: base=%s default_mode=%s", cfg.Parallel.BaseURL, cfg.Parallel.DefaultMode)
+	}
+
+	// Keyless stealth web search (DuckDuckGo via hermes sidecar) — backs
+	// /v1/parallel/search when no Parallel API key is configured.
+	var webSearcher *websearch.Searcher
+	if hermesClient != nil {
+		webSearcher = websearch.New(hermesClient)
+	}
+
+	// ── Proxy-pool auto-refresher (tests & hot-swaps SOCKS5 pool) ──────────
+	var poolRefresher *stealth.Refresher
+	if cfg.Stealth.AutoRefreshPool && hermesClient != nil && usProxyPool != nil {
+		poolRefresher = stealth.NewRefresher(usProxyPool, hermesClient, logger)
+		poolRefresher.RefreshInterval = time.Duration(cfg.Stealth.ProxyRefreshMins) * time.Minute
+		if cfg.Stealth.MaxPoolProxies > 0 {
+			poolRefresher.MaxProxies = cfg.Stealth.MaxPoolProxies
+		}
+		poolRefresher.OnEgress = func(ip string) { stealthMetrics.RecordEgress(ip) }
+		stopRefresher := poolRefresher.Start(context.Background())
+		defer stopRefresher()
+		logger.Printf("proxy-pool auto-refresher ON: interval=%s max=%d (probes via sidecar)",
+			poolRefresher.RefreshInterval, poolRefresher.MaxProxies)
+	}
+
+	// ── Fiber app ──────────────────────────────────────────────────────────
+	apiKey := ""
+	if len(cfg.Server.APIKeys) > 0 {
+		apiKey = cfg.Server.APIKeys[0]
+	}
+
+	var tokenPool httpapi.PoolStatsProvider
+	if len(cfg.Auth.APIKeys) > 0 {
+		tokenPool = staticStats{map[string]any{
+			"configured_keys": len(cfg.Auth.APIKeys),
+			"healthy":         len(cfg.Auth.APIKeys),
+		}}
+	}
+
+	app := httpapi.NewApp(httpapi.Options{
+		Model:       cfg.Upstream.DefaultModel,
+		ProxyAPIKey: apiKey,
+		Chat:        chatService,
+		TokenPool:   tokenPool,
+		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, Parallel: parallelClient,
+		ParallelMode: cfg.Parallel.DefaultMode,
+		WebSearcher:  webSearcher,
+		Stealth:      stealthMetrics,
+		Refresher: func() map[string]any {
+			if poolRefresher == nil {
+				return nil
+			}
+			return poolRefresher.Status()
+		},
+		ExtraHealth: func() map[string]any { return extraHealth(cfg, usProxyPool) },
+		AIStack: httpapi.ServeStaleCache(func() map[string]any {
+			return aiStackStatus(cfg, hermesClient, usProxyPool, parallelClient, webSearcher)
+		}),
+	})
+
+	// ── Listen ─────────────────────────────────────────────────────────────
+	addr := cfg.Server.ListenAddr
+	if addr == "" {
+		addr = ":8080"
+	}
+	logger.Printf("listening on %s | upstream=%s | proxy_backend=%s | keys=%d | stealth=%v",
+		addr, baseURL, passthroughBackendURL(cfg), len(cfg.Auth.APIKeys), cfg.Stealth.Enabled)
+
+	go func() {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-signals
+		logger.Printf("received %s, shutting down...", sig)
+		_ = app.Shutdown()
+	}()
+
+	if err := app.Listen(addr); err != nil {
+		logger.Fatalf("listen: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Health payload helpers
+// ---------------------------------------------------------------------------
+
+var startTime = time.Now()
+
+// Stealth-mode upstream relay timing: codebuff completions can run 3-5m.
+// The sidecar previously capped at 120s (110s TimeoutMS) which forced a
+// buffered non-stream path to hit infra 5m idle abort ("no data for 5m").
+// Raise to >5m for codebuff upstream; ipify/probe paths keep 12-15s.
+const (
+	stealthUpstreamTimeoutMS     = 280_000
+	stealthUpstreamClientTimeout = 300 * time.Second
+)
+
+// healthProbeCache caches probeBackend results for 5s so /healthz and
+// /ai-stack/status don't synchronously dial 2x per request with 2s timeouts.
+var (
+	healthCacheMu sync.RWMutex
+	healthCache   = map[string]struct {
+		val string
+		exp time.Time
+	}{}
+	healthCacheTTL = 5 * time.Second
+)
+
+func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[string]any {
+	body := map[string]any{
+		"session_id": "freebuff-unified",
+		"version":    "unified-v1",
+		"uptime":     time.Since(startTime).Round(time.Second).String(),
+		"ai_stack": map[string]any{
+			"freebuff_gateway": map[string]any{"port": 18080, "status": "active"},
+			"hermes_sidecar":   map[string]any{"port": 3101, "status": "active"},
+			"us_socks5_pool":   usProxyPool.Size(),
+		},
+	}
+	if n := len(cfg.Auth.APIKeys); n > 0 {
+		body["healthy_keys"] = n
+		body["total_keys"] = n
+	}
+	if usProxyPool != nil {
+		body["proxies"] = usProxyPool.Size()
+	}
+	if cfg.Proxy.Enabled {
+		backend := passthroughBackendURL(cfg)
+		body["proxy_backend"] = backend
+		body["proxy_status"] = probeBackend(backend)
+	}
+	return body
+}
+
+func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, usProxyPool *stealth.USProxyPool, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
+	proxyBackend := passthroughBackendURL(cfg)
+	return map[string]any{
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"gateway": map[string]any{
+			"version": "unified-v1",
+			"uptime":  time.Since(startTime).Round(time.Second).String(),
+		},
+		"infrastructure": map[string]any{
+			"freebuff_gateway": map[string]any{
+				"address":   "http://localhost:18080",
+				"status":    "ok",
+				"endpoints": []string{"/healthz", "/ai-stack/status", "/v1/models", "/v1/chat/completions", "/proxy/verify"},
+			},
+			"us_socks5_pool": usProxyPoolStatus(usProxyPool),
+			"autoclaw_provider": map[string]any{
+				"address": "http://localhost:31000",
+				"status":  probeBackend("http://localhost:31000"),
+				"models":  []string{"autoclaw/glm-5.2", "autoclaw/glm-5-turbo"},
+			},
+			"freebuff_proxy_backend": map[string]any{
+				"address":   proxyBackend,
+				"status":    probeBackend(proxyBackend),
+				"endpoints": []string{"/healthz", "/v1/models", "/v1/chat/completions", "/proxy/verify"},
+			},
+			"hermes_stealth_sidecar": hermesStatus(cfg, hermesClient),
+			"parallel_web_apis":      parallelStatus(parallelClient, webSearcher),
+		},
+		"providers": map[string]any{
+			"live": []string{
+				"Cloudflare Workers AI", "OpenRouter", "Fireworks",
+				"Google Gemini", "Cohere", "Groq Direct", "Local Ollama",
+			},
+			"wallet_gated": []string{
+				"Together", "DeepSeek", "Cerebras", "OpenAI", "Venice", "xAI/Grok", "ZenMux",
+			},
+			"blocked": []string{"NVIDIA", "Mistral"},
+		},
+	}
+}
+
+// hermesStatus reports the hermes stealth sidecar state for /ai-stack/status.
+func hermesStatus(cfg *config.Config, client *hermes.Client) map[string]any {
+	if !cfg.Hermes.Enabled || client == nil {
+		return map[string]any{
+			"address": cfg.Hermes.BaseURL,
+			"status":  "disabled",
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h, err := client.Health(ctx)
+	if err != nil {
+		return map[string]any{
+			"address": cfg.Hermes.BaseURL,
+			"status":  "unreachable",
+			"error":   err.Error(),
+		}
+	}
+	return map[string]any{
+		"address":   cfg.Hermes.BaseURL,
+		"status":    h.Status,
+		"hermes":    h.Hermes,
+		"node":      h.Node,
+		"sessions":  h.Sessions,
+		"endpoints": []string{"/v1/hermes/fetch", "/v1/hermes/session/:id", "/hermes/healthz"},
+	}
+}
+
+// keySet renders a masked key indicator for the check command.
+func keySet(k string) string {
+	if k == "" {
+		return "not set"
+	}
+	return "set"
+}
+
+// parallelStatus reports the web-search integration state for
+// /ai-stack/status: Parallel APIs when keyed, else the keyless stealth
+// DuckDuckGo backend.
+func parallelStatus(client *parallel.Client, searcher *websearch.Searcher) map[string]any {
+	if client.Enabled() {
+		return map[string]any{
+			"address":   "https://api.parallel.ai",
+			"status":    "ok",
+			"backend":   "parallel",
+			"endpoints": []string{"/v1/parallel/search", "/v1/parallel/extract"},
+		}
+	}
+	if searcher != nil {
+		return map[string]any{
+			"address":   "https://html.duckduckgo.com",
+			"status":    "ok",
+			"backend":   "duckduckgo-stealth (keyless, via hermes sidecar)",
+			"endpoints": []string{"/v1/parallel/search"},
+		}
+	}
+	return map[string]any{
+		"address": "https://api.parallel.ai",
+		"status":  "disabled",
+	}
+}
+
+// usProxyPoolStatus reports the built-in US SOCKS5 pool state for
+// /ai-stack/status — the gateway's own stealth-egress layer.
+func usProxyPoolStatus(pool *stealth.USProxyPool) map[string]any {
+	if pool == nil {
+		return map[string]any{"status": "disabled"}
+	}
+	return map[string]any{
+		"status":  "ok",
+		"proxies": pool.Size(),
+		"note":    "egress via hermes sidecar SOCKS5 handshake (RFC 1928)",
+	}
+}
+
+// passthroughBackendURL returns the address of the freebuff-proxy bridge
+// process behind this gateway. Priority: FREEBUFF_PROXY_BACKEND env, config
+// proxy.backend_url, then the :3457 default.
+func passthroughBackendURL(cfg *config.Config) string {
+	if b := os.Getenv("FREEBUFF_PROXY_BACKEND"); b != "" {
+		return b
+	}
+	if cfg.Proxy.BackendURL != "" {
+		return cfg.Proxy.BackendURL
+	}
+	return "http://127.0.0.1:3457"
+}
+
+// ---------------------------------------------------------------------------
+// Probe helpers
+// ---------------------------------------------------------------------------
+
+func probeBackend(base string) string {
+	if base == "" {
+		return "disabled"
+	}
+	// Cached 5s to avoid 2s*2 dial per /healthz under load.
+	healthCacheMu.RLock()
+	if e, ok := healthCache[base]; ok && time.Now().Before(e.exp) {
+		healthCacheMu.RUnlock()
+		return e.val
+	}
+	healthCacheMu.RUnlock()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	base = strings.TrimRight(base, "/")
+	val := "unreachable"
+	resp, err := client.Get(base + "/healthz")
+	if err == nil {
+		resp.Body.Close()
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			val = "ok"
+		case resp.StatusCode != http.StatusNotFound:
+			val = fmt.Sprintf("http_%d", resp.StatusCode)
+		default:
+			// /healthz 404 -> try /
+			goto probeRoot
+		}
+		healthCacheMu.Lock()
+		healthCache[base] = struct {
+			val string
+			exp time.Time
+		}{val, time.Now().Add(healthCacheTTL)}
+		healthCacheMu.Unlock()
+		return val
+	}
+probeRoot:
+	resp2, err := client.Get(base + "/")
+	if err == nil {
+		resp2.Body.Close()
+		if resp2.StatusCode < http.StatusInternalServerError {
+			val = "ok"
+		} else {
+			val = fmt.Sprintf("http_%d", resp2.StatusCode)
+		}
+	}
+	healthCacheMu.Lock()
+	healthCache[base] = struct {
+		val string
+		exp time.Time
+	}{val, time.Now().Add(healthCacheTTL)}
+	healthCacheMu.Unlock()
+	return val
+}
+
+func probeHTTPS(addr string) string {
+	if addr == "" {
+		return "disabled"
+	}
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"http/1.1"},
+		ServerName:         strings.Split(addr, ":")[0],
+	}
+	dialer := &tls.Dialer{Config: tlsConfig}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			DialContext:     dialer.DialContext,
+			TLSClientConfig: tlsConfig,
+			TLSNextProto:    make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		},
+	}
+	resp, err := client.Get("https://" + addr + "/healthz")
+	if err != nil {
+		return "unreachable"
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		return "ok"
+	}
+	return fmt.Sprintf("https_%d", resp.StatusCode)
+}
+
+// ---------------------------------------------------------------------------
+// PoolStatsProvider adapters
+// ---------------------------------------------------------------------------
+
+type staticStats struct{ v any }
+
+func (s staticStats) Stats() any { return s.v }
+
+type usProxyStats struct{ pool *stealth.USProxyPool }
+
+func (s usProxyStats) Stats() any {
+	if s.pool == nil {
+		return map[string]any{"size": 0}
+	}
+	return map[string]any{"size": s.pool.Size(), "mode": "round-robin"}
+}
+
+// ---------------------------------------------------------------------------
+// OAuth wiring
+// ---------------------------------------------------------------------------
+
+func newOAuthFlow(cfg *config.Config) *oauth.Flow {
+	baseURL := cfg.Upstream.BaseURL
+	if baseURL == "" {
+		baseURL = "https://codebuff.com"
+	}
+	return &oauth.Flow{
+		BaseURL:      baseURL,
+		PollInterval: 2 * time.Second,
+		PollTimeout:  5 * time.Minute,
+	}
+}
+
+// credentialsPath mirrors the freebuff-proxy default credential location:
+// $FREEBUFF_CREDS_DIR/credentials.json, auth.dir from config, or
+// ~/.freebuff/credentials.json.
+func credentialsPath(cfg *config.Config) string {
+	if p := os.Getenv("FREEBUFF_CREDS_DIR"); p != "" {
+		return filepath.Join(p, "credentials.json")
+	}
+	if cfg.Auth.Dir != "" {
+		return filepath.Join(cfg.Auth.Dir, "credentials.json")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".freebuff", "credentials.json")
+	}
+	return filepath.Join(home, ".freebuff", "credentials.json")
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+func startDashboard(dcfg config.DashboardConfig, logger *log.Logger) {
+	engine := dashboard.NewProbeEngine(5*time.Second, nil)
+	engine.Start()
+
+	mux := dashboard.NewHandler(engine, dcfg.Prefix)
+	server := &http.Server{Addr: dcfg.Addr, Handler: dashboard.LogMiddleware(mux)}
+
+	go func() {
+		logger.Printf("[dashboard] starting on %s (prefix: %s)", dcfg.Addr, dcfg.Prefix)
+		logger.Printf("[dashboard] UI http://%s/ | API http://%s/api/status | SSE http://%s/api/status/stream",
+			dcfg.Addr, dcfg.Addr, dcfg.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Printf("[dashboard] server error: %v", err)
+		}
+	}()
+}

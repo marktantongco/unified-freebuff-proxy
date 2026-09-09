@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{.Title}}</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #0d1117; color: #c9d1d9; }
+        h1 { color: #58a6ff; }
+        h2 { color: #8b949e; font-size: 1.2rem; margin-top: 2rem; }
+        .status-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1rem; margin: 1rem 0; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; }
+        .card h3 { margin: 0 0 0.5rem 0; color: #f0f6fc; font-size: 0.9rem; }
+        .card .port { font-size: 1.4rem; font-weight: bold; color: #58a6ff; margin: 0; }
+        .card .type { font-size: 0.8rem; color: #8b949e; }
+        .card .tags { font-size: 0.75rem; color: #8b949e; margin-top: 0.5rem; }
+        .status { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: bold; }
+        .status.up { background: #1a3a2a; color: #3fb950; }
+        .status.down { background: #3d1a1a; color: #f85149; }
+        .metric { font-size: 0.85rem; color: #8b949e; margin: 0.2rem 0; }
+        .metric strong { color: #f0f6fc; }
+        .summary { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+        .summary span { margin-right: 1.5rem; }
+        .refresh { margin-top: 1rem; }
+        button { background: #238636; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+        button:hover { background: #2ea043; }
+        .updated { font-size: 0.8rem; color: #8b949e; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>{{.Title}}</h1>
+    <p>Real-time health and metrics for all freebuff proxies.</p>
+
+    <div id="summary" class="summary">Loading...</div>
+    <div id="statuses" class="status-grid">Loading...</div>
+    <div class="refresh">
+        <button onclick="document.location.reload()">Refresh</button>
+    </div>
+    <div id="updated" class="updated"></div>
+
+    <script>
+        function statusClass(up) {
+            return up ? 'status up' : 'status down';
+        }
+        function statusText(up) {
+            return up ? 'UP' : 'DOWN';
+        }
+
+        async function load() {
+            try {
+                const resp = await fetch('/api/status');
+                const data = await resp.json();
+
+                const summary = document.getElementById('summary');
+                summary.innerHTML = `
+                    <span>Total: <strong>${data.summary.total}</strong></span>
+                    <span>Up: <strong style="color:#3fb950">${data.summary.up}</strong></span>
+                    <span>Down: <strong style="color:#f85149">${data.summary.down}</strong></span>
+                    <span>Avg: <strong>${data.summary.avg_latency_ms.toFixed(1)}ms</strong></span>
+                    <span>Min: <strong>${data.summary.min_latency_ms}ms</strong></span>
+                    <span>Max: <strong>${data.summary.max_latency_ms}ms</strong></span>
+                `;
+
+                const statuses = document.getElementById('statuses');
+                statuses.innerHTML = data.statuses.map(s => `
+                    <div class="card">
+                        <h3>${s.proxy.name}</h3>
+                        <p class="port">:${s.proxy.port}</p>
+                        <p class="type">${s.proxy.type}</p>
+                        <p class="tags">${s.proxy.tags}</p>
+                        <div>
+                            <span class="${statusClass(s.up)}">${statusText(s.up)}</span>
+                            <span class="metric">Latency: <strong>${s.latency_ms}ms</strong></span>
+                            ${s.models ? `<span class="metric">Models: <strong>${s.models}</strong></span>` : ''}
+                            ${s.error ? `<span class="metric" style="color:#f85149">${s.error}</span>` : ''}
+                        </div>
+                    </div>
+                `).join('');
+
+                document.getElementById('updated').textContent = 'Last updated: ' + new Date(data.time).toLocaleTimeString();
+            } catch (e) {
+                document.getElementById('statuses').innerHTML = '<p style="color:#f85149">Failed to load: ' + e.message + '</p>';
+            }
+        }
+
+        load();
+        setInterval(load, 5000);
+    </script>
+</body>
+</html>

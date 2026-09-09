@@ -1,0 +1,14 @@
+{
+  "name": "hermes-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HTTP sidecar exposing the vendored @kori_xyz/hermes stealth client (TLS 1.3, HTTP/2, proxies) to the freebuff-unified Go gateway",
+  "type": "module",
+  "main": "service.js",
+  "scripts": {
+    "start": "node service.js"
+  },
+  "dependencies": {
+    "@kori_xyz/hermes": "file:../hermes"
+  }
+}

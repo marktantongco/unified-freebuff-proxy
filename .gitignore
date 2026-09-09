@@ -1,0 +1,29 @@
+# ---- binaries & build artifacts ----
+bin/
+*.new
+*.test
+*.out
+
+# ---- secrets & live config ----
+# config.yaml holds real API keys for the running service; use
+# config.example.yaml as the committed template.
+config.yaml
+.env
+.env.*
+auths/
+
+# ---- egress pools (regenerate: scripts/fetch-proxies.sh) ----
+proxies.txt
+
+# ---- vendored / third-party (see planning/2026-09-09-unification-audit.md) ----
+deps/freebuff2api/
+deps/hermes-service/node_modules/
+deps/hermes/dist/
+
+# ---- node / python ----
+node_modules/
+__pycache__/
+*.pyc
+
+# ---- logs & state ----
+*.log
