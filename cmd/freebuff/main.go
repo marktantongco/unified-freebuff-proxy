@@ -30,6 +30,7 @@ import (
 	"freebuff-unified/internal/httpapi"
 	"freebuff-unified/internal/oauth"
 	"freebuff-unified/internal/parallel"
+	"freebuff-unified/internal/proxy"
 	"freebuff-unified/internal/session"
 	"freebuff-unified/internal/stealth"
 	"freebuff-unified/internal/websearch"
@@ -292,12 +293,22 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		}}
 	}
 
+	// Front-door passthrough: explicit opt-in via proxy.mode: passthrough.
+	// Default (proxy.mode unset/"report") keeps the native completion path.
+	var passthrough *proxy.Handler
+	if cfg.PassthroughEnabled() {
+		passthrough = proxy.NewHandler(logger)
+		logger.Printf("front-door passthrough ON: /v1/* relayed to %s (native /v1 routes disabled)", passthroughBackendURL(cfg))
+	}
+
 	app := httpapi.NewApp(httpapi.Options{
 		Model:       cfg.Upstream.DefaultModel,
 		ProxyAPIKey: apiKey,
 		Chat:        chatService,
 		TokenPool:   tokenPool,
 		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, Parallel: parallelClient,
+		Passthrough: passthrough,
+		BackendURL:  passthroughBackendURL(cfg),
 		ParallelMode: cfg.Parallel.DefaultMode,
 		WebSearcher:  webSearcher,
 		Stealth:      stealthMetrics,

@@ -43,11 +43,14 @@ limits:
   account_rpm: 30
   client_rpm: 60
 
-# Front-door passthrough — HEALTH REPORTING ONLY (not wired; see README).
-# proxy.enabled/backend_url feed /healthz and /ai-stack/status fields.
+# Backend freebuff-proxy reporting + optional front-door passthrough.
+#   mode: unset or "report"      -> native path serves /v1/* (default)
+#   mode: "passthrough"          -> /v1/* relayed byte-level to backend_url
+#                                   (native /v1 routes disabled; /healthz stays native)
 proxy:
   enabled: true
   backend_url: "http://127.0.0.1:3457"
+  # mode: "passthrough"
 
 dashboard:
   enabled: true

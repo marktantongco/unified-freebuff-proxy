@@ -542,3 +542,14 @@ contradicts earlier sections, **this addendum wins**.
 - Keyless DDG search through the hermes sidecar was returning 0 results
   (sidecar text bodies are JSON-encoded strings; `hermes.Response.Text()`
   now unwraps them). Fixed 2026-09-09; see `internal/hermes/client.go`.
+
+### Update — passthrough now wired as opt-in (2026-09-09, later)
+
+The earlier note that the passthrough is "NOT wired" is now outdated: it is
+wired behind an explicit opt-in. `proxy.mode: "passthrough"` + a backend URL
+activates byte-level `/v1/*` relay to the backend (SSE flush per frame,
+hop-by-hop headers stripped, errors relayed verbatim; tested in
+`internal/proxy` and `internal/httpapi/passthrough_wiring_test.go`). Default
+(`mode` unset or `"report"`) still serves `/v1/*` natively; `/healthz`,
+`/ai-stack/status`, `/proxy/verify` are always native. Config: see
+`config.example.yaml`.

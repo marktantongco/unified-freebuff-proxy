@@ -4,9 +4,11 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/adaptor"
 
 	"freebuff-unified/internal/hermes"
 	"freebuff-unified/internal/parallel"
+	"freebuff-unified/internal/proxy"
 	"freebuff-unified/internal/stealth"
 	"freebuff-unified/internal/websearch"
 )
@@ -40,6 +42,13 @@ type Options struct {
 	// AIStack, when set, backs the /ai-stack/status endpoint with a full
 	// infrastructure report instead of the plain health summary.
 	AIStack func() map[string]any
+	// Passthrough, when set, exposes the front-door byte-level relay to a
+	// freebuff-proxy backend. Activated only when cfg.Proxy.Mode is
+	// "passthrough"; otherwise native routes are registered (default).
+	Passthrough *proxy.Handler
+	// BackendURL is the freebuff-proxy backend address used when Passthrough
+	// is wired (from proxy.backend_url / FREEBUFF_PROXY_BACKEND).
+	BackendURL string
 }
 
 // NewApp creates a Fiber v3 app with health, models, and chat routes.
@@ -75,6 +84,16 @@ func NewApp(opts Options) *fiber.App {
 	app.Get("/healthz", handlers.Health)
 	app.Get("/ai-stack/status", handlers.AIStackStatus)
 	app.Get("/proxy/verify", handlers.Health)
+
+	if opts.Passthrough != nil {
+		// Front-door mode: /v1/* is relayed verbatim to the freebuff-proxy
+		// backend (its sessions, token pool, and dashboard do the protocol
+		// work). Everything else stays native.
+		opts.Passthrough.SetBackend(opts.BackendURL)
+		app.All("/v1/*", adaptor.HTTPHandler(opts.Passthrough))
+		return app
+	}
+
 	app.Get("/v1/models", handlers.Models)
 	app.Post("/v1/chat/completions", handlers.ChatCompletions)
 	app.Post("/v1/messages", handlers.AnthropicMessages)

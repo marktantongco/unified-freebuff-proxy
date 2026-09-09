@@ -85,6 +85,16 @@ type LimitsConfig struct {
 type ProxyConfig struct {
 	Enabled    bool   `yaml:"enabled"`
 	BackendURL string `yaml:"backend_url"`
+	// Mode selects how the gateway treats the backend:
+	//   "" or "report"      — health reporting only (default; native path serves /v1/*)
+	//   "passthrough"       — front-door mode: /v1/* is relayed byte-level to BackendURL
+	Mode string `yaml:"mode"`
+}
+
+// PassthroughEnabled reports whether the front-door passthrough should be
+// wired (explicit opt-in via mode: passthrough plus a backend URL).
+func (c *Config) PassthroughEnabled() bool {
+	return c.Proxy.Mode == "passthrough" && c.Proxy.BackendURL != ""
 }
 
 type DashboardConfig struct {

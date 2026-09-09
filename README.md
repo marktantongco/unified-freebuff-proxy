@@ -12,13 +12,19 @@ reporting.
 its own session manager, token pool, and upstream client
 (`internal/session`, `internal/freebuff`, `internal/httpapi`).
 
-The `proxy:` config block is **health reporting only**. `internal/proxy`
-implements a byte-level passthrough handler with tests, but it is **not
-wired** into the HTTP app; `proxy.enabled/backend_url` feed `/healthz`,
-`/ai-stack/status`, and the startup log line. Do not point clients at a
-"front-door mode" that doesn't exist. If you want the passthrough live, wire
-`proxy.NewHandler` into `internal/httpapi.NewApp` and route `/v1/*` to it
-when `cfg.Proxy.Enabled` — until then, treat it as dormant code.
+The `proxy:` config block has two modes:
+
+- **`mode: report` (default, unset)** — health reporting only: the backend URL
+  feeds `/healthz`, `/ai-stack/status`, and the startup log; all `/v1/*`
+  traffic is served by the native path.
+- **`mode: passthrough`** — explicit front-door opt-in: `/v1/*` is relayed
+  byte-level (SSE-safe, hop-by-hop headers stripped) to `backend_url`, whose
+  sessions, token pool, and `/admin` dashboard do the protocol work.
+  `/healthz` and `/ai-stack/status` remain native. Native `/v1` routes are
+  not registered in this mode.
+
+Activation requires `proxy.mode: "passthrough"` **and** a backend URL
+(`FREEBUFF_PROXY_BACKEND` env wins over `proxy.backend_url`).
 
 ```
 Clients (OpenAI/Anthropic SDKs)
