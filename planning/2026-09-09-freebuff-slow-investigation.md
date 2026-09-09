@@ -76,3 +76,23 @@ Source: gateway or upstream infra kills idle connection after 5m with no bytes.
 - `go test ./internal/... -run TestRefresher` with `Concurrency 2` should show <30s cycle vs 300s.
 - Longest repro: `timeout 400 curl --no-buffer ... stream:true` with deepseek 4k token prompt should not hit 5m abort.
 
+
+---
+
+## Verification Results — 2026-09-09 (post-fix benchmark run)
+
+| Check | Baseline (doc) | Measured | Verdict |
+|---|---|---|---|
+| CLI cold start (direct binary) | 1.55s | 1.59s mean, 1.54s best (5 runs) | unchanged Bun baseline (expected) |
+| CLI cold start (launcher) | 2.08s | 1.83s mean, 1.79s best | ~0.25s faster (fast-path) |
+| /healthz warm | ~0.15s under load | 0.7ms warm; 3–6ms cold(5s TTL) | fixed |
+| /ai-stack/status (sidecar probes) | up to 60s if sidecar down | 0.5–0.9ms warm; 11–144ms cold | serve-stale cache working |
+| SSE first byte | buffered risk | `: connecting` comment immediate; 602 frames continuous | flush OK |
+| 15s heartbeat ticker | — | correctly idle (no >15s gap in test streams) | structural; covers stalls |
+| Native chat completion | — | **upstream rejects non-CLI envelope** (`free_mode_cli_required`, IP-blocked under rotating SOCKS5) | root cause of auth_failed |
+| Passthrough chat (:18080→:3457→upstream) | — | content `READY`, finish stop, cost 0 | **working** |
+
+Conclusion: all "immediate" perf items from this doc are verified landed. The
+remaining native-path blocker is upstream CLI-envelope enforcement, not
+latency — production traffic now rides proxy.mode: passthrough (opt-in wired
+2026-09-09), which uses :3457's CLI-faithful envelope and stable egress.
