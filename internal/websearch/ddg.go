@@ -57,7 +57,25 @@ var (
 	reTag  = regexp.MustCompile(`<[^>]+>`)
 	// DDG wraps URLs as /l/?uddg=<urlencoded>&...
 	reUddg = regexp.MustCompile(`uddg=([^&]+)`)
+	// <title> fallback for pages without a usable heading.
+	reTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	// Collapse runs of whitespace left after tag stripping.
+	reSpaces = regexp.MustCompile(`\s+`)
+	// Block these page regions to keep only readable article content. Go's
+	// RE2 has no backreferences, so each (non-nesting) block tag gets its own
+	// pattern rather than one `<(script|...)>.*?</\1>`.
+	blockTags = []string{"script", "style", "noscript", "svg", "head", "nav", "footer", "aside", "header"}
+	reBlocks  = func() []*regexp.Regexp {
+		out := make([]*regexp.Regexp, 0, len(blockTags))
+		for _, t := range blockTags {
+			out = append(out, regexp.MustCompile(`(?is)<`+t+`[^>]*>.*?</`+t+`>`))
+		}
+		return out
+	}()
 )
+
+// maxPageChars caps how much of a fetched page is kept for synthesis.
+const maxPageChars = 16_000
 
 // Search runs one query and returns normalized results.
 func (s *Searcher) Search(ctx context.Context, query string, maxResults int) (*Response, error) {
@@ -160,6 +178,72 @@ func parseResults(body string, max int) []Result {
 		}
 	}
 	return out
+}
+
+// Page is a single keyless full-page read via the stealth sidecar. It backs
+// /v1/deep-research extraction when no Parallel API key is configured.
+type Page struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+	Text  string `json:"text"`
+}
+
+// FetchPage reads one page through the stealth sidecar and returns cleaned
+// article text (script/style/nav stripped, whitespace collapsed, 16k cap).
+func (s *Searcher) FetchPage(ctx context.Context, rawURL string) (*Page, error) {
+	if s.sidecar == nil {
+		return nil, fmt.Errorf("websearch: stealth sidecar not configured")
+	}
+	if strings.TrimSpace(rawURL) == "" {
+		return nil, fmt.Errorf("websearch: empty url")
+	}
+	timeout := s.Timeout
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	resp, err := s.sidecar.Fetch(cctx, hermes.Request{
+		URL:       rawURL,
+		Method:    "GET",
+		TimeoutMS: int(timeout.Milliseconds()),
+		HTTP2:     true,
+		Headers:   map[string]string{"Accept": "text/html,text/plain", "Accept-Language": "en-US,en;q=0.9"},
+		JSON:      boolPtr(false),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Status != 200 {
+		return nil, fmt.Errorf("page http %d", resp.Status)
+	}
+	raw := resp.Text()
+	text := cleanPageText(raw)
+	if len(text) > maxPageChars {
+		text = text[:maxPageChars]
+	}
+	return &Page{Title: extractTitle(raw), URL: rawURL, Text: text}, nil
+}
+
+// extractTitle pulls the <title> text (or first <h1>) from a raw page.
+func extractTitle(raw string) string {
+	if m := reTitle.FindStringSubmatch(raw); m != nil {
+		if t := strings.TrimSpace(stripTags(m[1])); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// cleanPageText strips non-content regions, removes tags, unescapes entities,
+// and collapses whitespace into readable text.
+func cleanPageText(raw string) string {
+	for _, re := range reBlocks {
+		raw = re.ReplaceAllString(raw, " ")
+	}
+	raw = stripTags(raw)
+	raw = reSpaces.ReplaceAllString(raw, " ")
+	return strings.TrimSpace(raw)
 }
 
 // unwrapDDG resolves DDG's /l/?uddg= redirect wrapper to the real URL.

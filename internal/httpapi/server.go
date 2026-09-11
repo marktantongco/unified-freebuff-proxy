@@ -24,9 +24,16 @@ type Options struct {
 	// (/hermes/healthz, /v1/hermes/fetch, /v1/hermes/session/:id).
 	Hermes *hermes.Client
 	// Parallel, when enabled, exposes key-gated /v1/parallel/search and
-	// /v1/parallel/extract proxies to the Parallel Web APIs.
-	Parallel     *parallel.Client
-	ParallelMode string
+	// /v1/parallel/extract proxies to the Parallel Web APIs, plus the Layer A
+	// keyless-first /v1/deep-research Task orchestration and /v1/responses.
+	Parallel          *parallel.Client
+	ParallelMode      string
+	ParallelProcessor string
+	// Research tunes the native Layer B harness (/v1/deep-research fallback).
+	Research ResearchConfig
+	// Limiter, when set, enforces the three-tier RPM policy
+	// (global/account/client) on all credentialed routes.
+	Limiter *RateLimiter
 	// WebSearcher is the keyless stealth search backend (hermes sidecar).
 	// /v1/parallel/search falls back to it when Parallel has no API key.
 	WebSearcher *websearch.Searcher
@@ -64,6 +71,8 @@ func NewApp(opts Options) *fiber.App {
 	handlers.hermes = opts.Hermes
 	handlers.parallel = opts.Parallel
 	handlers.parallelMode = opts.ParallelMode
+	handlers.parallelProcessor = opts.ParallelProcessor
+	handlers.research = opts.Research
 	handlers.webSearcher = opts.WebSearcher
 	handlers.stealth = opts.Stealth
 	handlers.refresher = opts.Refresher
@@ -81,9 +90,23 @@ func NewApp(opts Options) *fiber.App {
 		})
 	}
 
+	// Three-tier RPM policy (global/account/client). Probes stay public.
+	if opts.Limiter != nil {
+		app.Use(rateLimitMiddleware(opts.Limiter))
+	}
+
 	app.Get("/healthz", handlers.Health)
 	app.Get("/ai-stack/status", handlers.AIStackStatus)
 	app.Get("/proxy/verify", handlers.Health)
+
+	// Deep-research (Layer A Task runs, keyless-first, native Layer B
+	// fallback) and the /v1/responses surface. Registered before the
+	// front-door relay so they stay native — key-gated by the auth middleware
+	// above — even in passthrough mode.
+	app.Post("/v1/deep-research", handlers.DeepResearch)
+	app.Get("/v1/deep-research/:id", handlers.DeepResearchGet)
+	app.Get("/v1/deep-research/:id/events", handlers.DeepResearchEvents)
+	app.Post("/v1/responses", handlers.ResponsesPassthrough)
 
 	if opts.Passthrough != nil {
 		// Front-door mode: /v1/* is relayed verbatim to the freebuff-proxy

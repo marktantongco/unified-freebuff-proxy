@@ -100,8 +100,10 @@ func runCheck(cfg *config.Config, configPath string) {
 		cfg.Stealth.Enabled, cfg.Stealth.Profile, len(cfg.Stealth.USProxies), cfg.Stealth.StripHeaders)
 	fmt.Printf("limits:    global_rpm=%d\n", cfg.Limits.GlobalRPM)
 	fmt.Printf("dashboard: enabled=%v addr=%s\n", cfg.Dashboard.Enabled, cfg.Dashboard.Addr)
-	fmt.Printf("parallel:   enabled=%v mode=%s key=%s\n",
-		cfg.Parallel.Enabled, cfg.Parallel.DefaultMode, keySet(cfg.Parallel.APIKey))
+	fmt.Printf("parallel:   enabled=%v mode=%s processor=%s key=%s\n",
+		cfg.Parallel.Enabled, cfg.Parallel.DefaultMode, cfg.Parallel.DefaultProcessor, keySet(cfg.Parallel.APIKey))
+	fmt.Printf("research:   enabled=%v max_queries=%d fan_out=%d timeout_ms=%d\n",
+		cfg.Research.Enabled, cfg.Research.MaxQueries, cfg.Research.FanOut, cfg.Research.TimeoutMS)
 }
 
 func runLogin(cfg *config.Config) error {
@@ -178,6 +180,10 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		}
 	}
 
+	// ── Three-tier RPM policy (global/account/client) ──────────────────────
+	limiter := httpapi.NewRateLimiter(cfg.Limits.GlobalRPM, cfg.Limits.AccountRPM, cfg.Limits.ClientRPM)
+	logger.Printf("rate limits: global=%d rpm, account=%d rpm, client=%d rpm", cfg.Limits.GlobalRPM, cfg.Limits.AccountRPM, cfg.Limits.ClientRPM)
+
 	// ── US SOCKS5 proxy pool (freebuff-unified) ────────────────────────────
 	var usProxyPool *stealth.USProxyPool
 	if len(cfg.Stealth.USProxies) > 0 {
@@ -246,15 +252,20 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 			baseURL, cfg.Hermes.BaseURL, proxies)
 	}
 
-	// ── Parallel Web APIs client (search/extract) ───────────────────────
+	// ── Parallel Web APIs client (search/extract/task/responses) ──────────
+	// Keyless-first: the client is wired whenever parallel.enabled is true;
+	// the API key (config or PARALLEL_API_KEY) is optional and only sent when
+	// present. Layer A /v1/deep-research and /v1/responses try the keyless
+	// call and fall back to the native harness on auth rejection.
 	parallelAPIKey := cfg.Parallel.APIKey
 	if parallelAPIKey == "" {
 		parallelAPIKey = os.Getenv("PARALLEL_API_KEY")
 	}
 	var parallelClient *parallel.Client
-	if cfg.Parallel.Enabled && parallelAPIKey != "" {
+	if cfg.Parallel.Enabled {
 		parallelClient = parallel.New(cfg.Parallel.BaseURL, parallelAPIKey)
-		logger.Printf("parallel web APIs enabled: base=%s default_mode=%s", cfg.Parallel.BaseURL, cfg.Parallel.DefaultMode)
+		logger.Printf("parallel APIs enabled: base=%s default_mode=%s default_processor=%s key=%s",
+			cfg.Parallel.BaseURL, cfg.Parallel.DefaultMode, cfg.Parallel.DefaultProcessor, keySet(parallelAPIKey))
 	}
 
 	// Keyless stealth web search (DuckDuckGo via hermes sidecar) — backs
@@ -298,7 +309,15 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 	var passthrough *proxy.Handler
 	if cfg.PassthroughEnabled() {
 		passthrough = proxy.NewHandler(logger)
-		logger.Printf("front-door passthrough ON: /v1/* relayed to %s (native /v1 routes disabled)", passthroughBackendURL(cfg))
+		logger.Printf("front-door passthrough ON: /v1/chat|models|messages relayed to %s (deep-research + /v1/responses stay native)", passthroughBackendURL(cfg))
+		// In passthrough mode the backend owns sessions/chat. Point the
+		// native Layer B research planner (and the /v1/responses fallback) at
+		// the backend instead of the gateway's own freebuff client, which
+		// does not share that backend's sessions.
+		if apiKey != "" {
+			chatService = httpapi.NewBackendChatService(passthroughBackendURL(cfg), apiKey)
+			logger.Printf("mesh research chat: routed through backend %s (session owner)", passthroughBackendURL(cfg))
+		}
 	}
 
 	app := httpapi.NewApp(httpapi.Options{
@@ -307,11 +326,14 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		Chat:        chatService,
 		TokenPool:   tokenPool,
 		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, Parallel: parallelClient,
-		Passthrough: passthrough,
-		BackendURL:  passthroughBackendURL(cfg),
-		ParallelMode: cfg.Parallel.DefaultMode,
-		WebSearcher:  webSearcher,
-		Stealth:      stealthMetrics,
+		Passthrough:       passthrough,
+		BackendURL:        passthroughBackendURL(cfg),
+		ParallelMode:      cfg.Parallel.DefaultMode,
+		ParallelProcessor: cfg.Parallel.DefaultProcessor,
+		Research:          researchConfig(cfg),
+		Limiter:           limiter,
+		WebSearcher:       webSearcher,
+		Stealth:           stealthMetrics,
 		Refresher: func() map[string]any {
 			if poolRefresher == nil {
 				return nil
@@ -359,6 +381,20 @@ const (
 	stealthUpstreamTimeoutMS     = 280_000
 	stealthUpstreamClientTimeout = 300 * time.Second
 )
+
+// researchConfig maps the YAML research block onto the Layer B harness
+// config. An empty Model lets the handler fall back to the upstream default.
+func researchConfig(cfg *config.Config) httpapi.ResearchConfig {
+	r := cfg.Research
+	return httpapi.ResearchConfig{
+		Enabled:         r.Enabled,
+		Model:           r.Model,
+		MaxQueries:      r.MaxQueries,
+		FanOut:          r.FanOut,
+		ExtractPerQuery: r.ExtractPerQuery,
+		Timeout:         time.Duration(r.TimeoutMS) * time.Millisecond,
+	}
+}
 
 // healthProbeCache caches probeBackend results for 5s so /healthz and
 // /ai-stack/status don't synchronously dial 2x per request with 2s timeouts.
@@ -409,7 +445,7 @@ func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, usProxyPool 
 			"freebuff_gateway": map[string]any{
 				"address":   "http://localhost:18080",
 				"status":    "ok",
-				"endpoints": []string{"/healthz", "/ai-stack/status", "/v1/models", "/v1/chat/completions", "/proxy/verify"},
+				"endpoints": []string{"/healthz", "/ai-stack/status", "/v1/models", "/v1/chat/completions", "/v1/deep-research", "/v1/responses", "/proxy/verify"},
 			},
 			"us_socks5_pool": usProxyPoolStatus(usProxyPool),
 			"autoclaw_provider": map[string]any{
@@ -478,26 +514,30 @@ func keySet(k string) string {
 // /ai-stack/status: Parallel APIs when keyed, else the keyless stealth
 // DuckDuckGo backend.
 func parallelStatus(client *parallel.Client, searcher *websearch.Searcher) map[string]any {
-	if client.Enabled() {
+	if client == nil {
 		return map[string]any{
 			"address":   "https://api.parallel.ai",
-			"status":    "ok",
-			"backend":   "parallel",
-			"endpoints": []string{"/v1/parallel/search", "/v1/parallel/extract"},
+			"status":    "disabled",
+			"backend":   "none",
+			"endpoints": []string{"/v1/deep-research"},
 		}
+	}
+	base := map[string]any{
+		"address": "https://api.parallel.ai",
+		"backend": "parallel",
+	}
+	if client.Enabled() {
+		base["status"] = "ok"
+	} else {
+		base["status"] = "keyless"
+		base["note"] = "Task runs + /v1/responses attempt calls without a key and fall back to the native harness on auth rejection"
 	}
 	if searcher != nil {
-		return map[string]any{
-			"address":   "https://html.duckduckgo.com",
-			"status":    "ok",
-			"backend":   "duckduckgo-stealth (keyless, via hermes sidecar)",
-			"endpoints": []string{"/v1/parallel/search"},
-		}
+		base["endpoints"] = []string{"/v1/parallel/search", "/v1/parallel/extract", "/v1/deep-research", "/v1/responses"}
+	} else {
+		base["endpoints"] = []string{"/v1/deep-research", "/v1/responses"}
 	}
-	return map[string]any{
-		"address": "https://api.parallel.ai",
-		"status":  "disabled",
-	}
+	return base
 }
 
 // usProxyPoolStatus reports the built-in US SOCKS5 pool state for

@@ -553,3 +553,52 @@ hop-by-hop headers stripped, errors relayed verbatim; tested in
 (`mode` unset or `"report"`) still serves `/v1/*` natively; `/healthz`,
 `/ai-stack/status`, `/proxy/verify` are always native. Config: see
 `config.example.yaml`.
+
+---
+
+## 📌 Addendum — 2026-09-10 Deep-Research + /v1/responses
+
+New native surfaces, registered before the passthrough relay so they stay
+native (and key-gated by the auth middleware) even in `proxy.mode:
+passthrough`:
+
+| Endpoint | Layer | Behavior |
+|----------|-------|----------|
+| `POST /v1/deep-research` | A | Parallel **Task run** create — keyless-first: no/casting `PARALLEL_API_KEY` is fine. Parallel auth rejection (401/403/402) or absent client falls back to native Layer B. `stream:true` gives SSE progress; buffered gives JSON `{run_id,...}`. |
+| `GET /v1/deep-research/:id` | A | Task run status/result (`backend: parallel`). |
+| `GET /v1/deep-research/:id/events` | A | Relay of Parallel `enable_events` SSE with 15s heartbeat. |
+| `POST /v1/deep-research` (no key) | B | **Native harness**: plan queries (model chat, `temperature ~0.2`, JSON) → parallel fan-out DDG stealth + Parallel Search (`fast`) bounded per-opts → Extract/fetch top URLs → synthesize cited report. Frames stream as they land. |
+| `POST /v1/responses` | A/B | Keyless Parallel Responses relay (`parallel.Responses`); on auth rejection serves the native chat in Responses SSE shape. |
+
+Keyless change: `internal/parallel/client.go` no longer requires
+`PARALLEL_API_KEY`; the key header is attached only when present and
+401/403/402 from `CreateTaskRun`/`Responses` trigger the native fallback.
+Default processor is `pro-fast` (fast family per the research plan).
+
+### Streaming bug caught by the new tests (`internal/httpapi/research_test.go`,
+`fakeParallelAPI` httptest server)
+
+Handler-scope `defer cancel()` (and `defer resp.Body.Close()`) set up early
+then `SendStreamWriter` returned promptly → the body-stream callback ran with
+an already-canceled context / closed body → **zero bytes** on real streams.
+Tests exposed empty-body failures; ownership of ctx and upstream body was
+moved *inside* the stream callback (pattern already used by
+`relayTaskEvents`). Fixed in: `streamResearch`, `bufferedResearch`,
+`responsesNativeStream`, `relayResponses`. All `httpapi` tests green; `go
+vet`/`gofmt` clean.
+
+### Environment notes (this deployment)
+
+- **Native freebuff session service is broken here** (fails even a plain
+  `/v1/chat/completions` with `freebuff_session_error`); the passthrough
+  backend `:3457` is the only working chat path. Layer B's planner therefore
+  errors live in this sandbox — the code path is proven by tests with a
+  working chat service. Needs a working native session/credential to demo
+  end-to-end.
+- **Model availability** upstream: only `mimo/mimo-v2.5` currently live;
+  `deepseek/deepseek-v4-pro` (config default) is deprecated
+  (`model_unavailable`). Pass `model: "mimo/mimo-v2.5"` for live runs.
+- Rate limiter (global/account/client RPM) is parsed but **not yet enforced**
+  in `internal/httpapi` — pre-existing gap; deep-research shares it.
+  `PARALLEL_API_KEY` is not set on this host (keyless-mode confirmed via
+  `api.parallel.ai` 401).

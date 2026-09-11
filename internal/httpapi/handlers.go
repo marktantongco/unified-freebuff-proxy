@@ -56,18 +56,20 @@ type PoolStatsProvider interface {
 }
 
 type handlers struct {
-	model        string
-	chat         ChatService
-	tokenPool    PoolStatsProvider
-	proxyPool    PoolStatsProvider
-	hermes       *hermes.Client
-	parallel     *parallel.Client
-	parallelMode string
-	webSearcher  *websearch.Searcher
-	stealth      *stealth.Metrics
-	refresher    func() map[string]any
-	extraHealth  func() map[string]any
-	aiStack      func() map[string]any
+	model             string
+	chat              ChatService
+	tokenPool         PoolStatsProvider
+	proxyPool         PoolStatsProvider
+	hermes            *hermes.Client
+	parallel          *parallel.Client
+	parallelMode      string
+	parallelProcessor string
+	webSearcher       *websearch.Searcher
+	research          ResearchConfig
+	stealth           *stealth.Metrics
+	refresher         func() map[string]any
+	extraHealth       func() map[string]any
+	aiStack           func() map[string]any
 }
 
 type notConfiguredChatService struct{}
