@@ -37,6 +37,10 @@ type Options struct {
 	// WebSearcher is the keyless stealth search backend (hermes sidecar).
 	// /v1/parallel/search falls back to it when Parallel has no API key.
 	WebSearcher *websearch.Searcher
+	// Searxng is an optional SearXNG search backend (keyless JSON API).
+	Searxng *websearch.SearxngSearcher
+	// SearchCache is an optional TTL cache for search results.
+	SearchCache *websearch.Cache
 	// Stealth, when set, backs GET /stealth/status with transport metrics
 	// (sidecar latency, fallback counts, egress IPs used).
 	Stealth *stealth.Metrics
@@ -74,6 +78,8 @@ func NewApp(opts Options) *fiber.App {
 	handlers.parallelProcessor = opts.ParallelProcessor
 	handlers.research = opts.Research
 	handlers.webSearcher = opts.WebSearcher
+	handlers.searxng = opts.Searxng
+	handlers.searchCache = opts.SearchCache
 	handlers.stealth = opts.Stealth
 	handlers.refresher = opts.Refresher
 	handlers.extraHealth = opts.ExtraHealth

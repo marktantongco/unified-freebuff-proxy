@@ -33,8 +33,9 @@ func NewBackendChatService(baseURL, apiKey string) *BackendChatService {
 		apiKey:  apiKey,
 		client: &http.Client{
 			Transport: &http.Transport{
-				// Planner calls carry a 60s ctx timeout; the backend may hold
-				// the connection while composing (heartbeat below).
+				MaxIdleConns:          50,
+				MaxIdleConnsPerHost:   10,
+				IdleConnTimeout:       90 * time.Second,
 				ResponseHeaderTimeout: 55 * time.Second,
 			},
 		},

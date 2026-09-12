@@ -102,6 +102,9 @@ type StealthConfig struct {
 	AutoRefreshPool bool `yaml:"auto_refresh_pool"`
 	// MaxPoolProxies caps the refreshed pool size (default 12).
 	MaxPoolProxies int `yaml:"max_pool_proxies"`
+	// SearxngURL is the base URL of a SearXNG instance (e.g. http://127.0.0.1:8888).
+	// Empty = SearXNG backend disabled. Can also be set via SEARXNG_URL env.
+	SearxngURL string `yaml:"searxng_url"`
 }
 
 type LimitsConfig struct {

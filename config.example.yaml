@@ -37,6 +37,9 @@ stealth:
   us_proxies:
     - "socks5://REPLACE_ME_HOST_1:1080"
     - "socks5://REPLACE_ME_HOST_2:1080"
+  # SearXNG keyless search backend (optional).
+  # searxng_url: "http://127.0.0.1:8888"
+  # Set SEARXNG_URL env to override
 
 limits:
   global_rpm: 120

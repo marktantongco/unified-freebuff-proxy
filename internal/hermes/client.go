@@ -26,7 +26,14 @@ type Client struct {
 func New(baseURL string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 60 * time.Second},
+		http: &http.Client{
+			Timeout: 60 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        50,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 }
 

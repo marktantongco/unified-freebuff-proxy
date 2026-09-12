@@ -65,11 +65,14 @@ type handlers struct {
 	parallelMode      string
 	parallelProcessor string
 	webSearcher       *websearch.Searcher
+	searxng           *websearch.SearxngSearcher
+	searchCache       *websearch.Cache
 	research          ResearchConfig
 	stealth           *stealth.Metrics
 	refresher         func() map[string]any
 	extraHealth       func() map[string]any
 	aiStack           func() map[string]any
+	adaptive          *adaptiveController
 }
 
 type notConfiguredChatService struct{}

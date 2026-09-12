@@ -2,8 +2,10 @@ package httpapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,9 +16,75 @@ import (
 
 	"freebuff-unified/internal/openai"
 	"freebuff-unified/internal/parallel"
+	"freebuff-unified/internal/websearch"
 
 	"github.com/gofiber/fiber/v3"
 )
+
+// framePool reuses bytes.Buffer for SSE frame encoding to reduce allocations.
+var framePool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// adaptiveController adjusts per-backend request rate based on success/failure.
+// Not a hard rate limiter; it gently nudges fanOut up/down to avoid 429s.
+type adaptiveController struct {
+	mu          sync.Mutex
+	parallelRPS float64 // starts 2.0, min 0.5, max 5.0
+	ddgRPS      float64
+	searxngRPS  float64
+	fanOut      int // current fanOut clamp (1-32)
+	last429     time.Time
+}
+
+func (a *adaptiveController) init(fanOut int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.parallelRPS = 2.0
+	a.ddgRPS = 2.0
+	a.searxngRPS = 2.0
+	a.fanOut = fanOut
+	a.last429 = time.Time{}
+}
+
+func (a *adaptiveController) recordSuccess(backend string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if time.Since(a.last429) > 5*time.Minute {
+		// Slowly recover after 5 minutes without 429s
+		switch backend {
+		case "parallel":
+			a.parallelRPS = min(a.parallelRPS*1.1, 5.0)
+		case "ddg":
+			a.ddgRPS = min(a.ddgRPS*1.1, 5.0)
+		case "searxng":
+			a.searxngRPS = min(a.searxngRPS*1.1, 5.0)
+		}
+	}
+}
+
+func (a *adaptiveController) record429(backend string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.last429 = time.Now()
+	switch backend {
+	case "parallel":
+		a.parallelRPS = max(a.parallelRPS*0.5, 0.5)
+	case "ddg":
+		a.ddgRPS = max(a.ddgRPS*0.5, 0.5)
+	case "searxng":
+		a.searxngRPS = max(a.searxngRPS*0.5, 0.5)
+	}
+	// Clamp fanOut based on lowest RPS
+	minRPS := min(a.parallelRPS, a.ddgRPS, a.searxngRPS)
+	a.fanOut = max(1, min(int(minRPS*2), 32))
+}
+
+func (a *adaptiveController) getFanOut() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.fanOut
+}
 
 // ResearchConfig configures the native /v1/deep-research harness (Layer B).
 // The gateway LLM plans sub-queries, they fan out to the Parallel Search API
@@ -315,12 +383,17 @@ func (h *handlers) relayTaskEvents(c fiber.Ctx, runID string) error {
 		go func() {
 			defer close(frames)
 			emit := func(payload any) error {
-				buf := &strings.Builder{}
+				buf := framePool.Get().(*bytes.Buffer)
+				buf.Reset()
 				if err := writeSSE(buf, payload); err != nil {
+					framePool.Put(buf)
 					return err
 				}
+				frame := make([]byte, buf.Len())
+				copy(frame, buf.Bytes())
+				framePool.Put(buf)
 				select {
-				case frames <- []byte(buf.String()):
+				case frames <- frame:
 					return nil
 				case <-ctx.Done():
 					return ctx.Err()
@@ -719,12 +792,17 @@ func (h *handlers) streamResearch(c fiber.Ctx, opts researchOpts) error {
 		go func() {
 			defer close(frames)
 			emit := func(payload any) error {
-				buf := &strings.Builder{}
+				buf := framePool.Get().(*bytes.Buffer)
+				buf.Reset()
 				if err := writeSSE(buf, payload); err != nil {
+					framePool.Put(buf)
 					return err
 				}
+				frame := make([]byte, buf.Len())
+				copy(frame, buf.Bytes())
+				framePool.Put(buf)
 				select {
-				case frames <- []byte(buf.String()):
+				case frames <- frame:
 					return nil
 				case <-ctx.Done():
 					return ctx.Err()
@@ -786,6 +864,14 @@ func (h *handlers) runResearch(ctx context.Context, opts researchOpts) (*researc
 		SynthModel:   opts.model,
 	}
 
+	// Adaptive controller: starts at requested fanOut, adjusts on 429s.
+	if h.adaptive == nil {
+		h.adaptive = &adaptiveController{}
+	}
+	h.adaptive.init(opts.fanOut)
+	// Use adaptive fanOut for this run.
+	effectiveFanOut := h.adaptive.getFanOut()
+
 	// Phase 1: planner LLM turns the brief into sub-queries.
 	plan, err := h.planQueries(ctx, opts.model, opts.input, opts.maxQueries)
 	if err != nil {
@@ -806,10 +892,11 @@ func (h *handlers) runResearch(ctx context.Context, opts researchOpts) (*researc
 	// Phase 2: fan out bounded-concurrency search + extract.
 	var (
 		mu          sync.Mutex
-		evidenceMap = make(map[string]evidence) // url → evidence
+		evidenceMap = make(map[string]evidence) // normalized URL → evidence
+		globalSeen  = make(map[string]bool)     // cross-query URL dedup
 		extractRun  int
 	)
-	sem := make(chan struct{}, opts.fanOut)
+	sem := make(chan struct{}, effectiveFanOut)
 	var wg sync.WaitGroup
 	for _, q := range queries {
 		q := q
@@ -833,7 +920,12 @@ func (h *handlers) runResearch(ctx context.Context, opts researchOpts) (*researc
 			}
 			mu.Lock()
 			for _, it := range items {
-				evidenceMap[it.URL] = it
+				norm := normalizeURL(it.URL)
+				if globalSeen[norm] {
+					continue // skip duplicate across queries
+				}
+				globalSeen[norm] = true
+				evidenceMap[norm] = it
 			}
 			extractRun += fetched
 			mu.Unlock()
@@ -932,11 +1024,15 @@ func (h *handlers) researchBackends() (string, string) {
 	search := "none"
 	extract := "none"
 	if h.parallel != nil && h.parallel.Enabled() {
-		search, extract = "parallel+duckduckgo-stealth", "parallel"
+		search, extract = "parallel+duckduckgo-stealth+searxng", "parallel"
 		return search, extract
 	}
-	if h.webSearcher != nil {
-		search, extract = "duckduckgo-stealth", "duckduckgo-stealth"
+	if h.webSearcher != nil || (h.searxng != nil && h.searxng.Enabled()) {
+		search = "duckduckgo-stealth"
+		if h.searxng != nil && h.searxng.Enabled() {
+			search += "+searxng"
+		}
+		extract = "duckduckgo-stealth"
 	}
 	return search, extract
 }
@@ -962,14 +1058,36 @@ func (h *handlers) researchQuery(ctx context.Context, query, objective string, e
 		hits = append(hits, hit{title, url, snippet})
 	}
 
+	// Parallel Search with cache
 	if h.parallel != nil && h.parallel.Enabled() {
-		if resp, err := h.parallel.Search(ctx, parallel.SearchRequest{
-			Objective:     objective,
-			SearchQueries: []string{query},
-			Mode:          "fast",
-			MaxCharsTotal: 15_000,
-			SessionID:     "deep-research",
-		}); err == nil && resp != nil {
+		cacheKey := fmt.Sprintf("parallel:%s:%s", query, objective)
+		var resp *parallel.SearchResponse
+		if h.searchCache != nil {
+			if cached, ok := h.searchCache.GetOrLoad(cacheKey); ok {
+				// Convert cached websearch.Response to parallel.SearchResponse
+				resp = h.cachedToParallelSearch(cached)
+			}
+		}
+		if resp == nil {
+			if r, err := h.parallel.Search(ctx, parallel.SearchRequest{
+				Objective:     objective,
+				SearchQueries: []string{query},
+				Mode:          "fast",
+				MaxCharsTotal: 15_000,
+				SessionID:     "deep-research",
+			}); err == nil && r != nil {
+				resp = r
+				if h.adaptive != nil {
+					h.adaptive.recordSuccess("parallel")
+				}
+				if h.searchCache != nil {
+					h.searchCache.Set(cacheKey, h.parallelSearchToCached(resp))
+				}
+			} else if err != nil && h.adaptive != nil && isRateLimitError(err) {
+				h.adaptive.record429("parallel")
+			}
+		}
+		if resp != nil {
 			for _, r := range resp.Results {
 				snip := ""
 				if len(r.Excerpts) > 0 {
@@ -979,8 +1097,59 @@ func (h *handlers) researchQuery(ctx context.Context, query, objective string, e
 			}
 		}
 	}
+
+	// DDG Stealth Search with cache
 	if h.webSearcher != nil {
-		if resp, err := h.webSearcher.Search(ctx, query, 8); err == nil {
+		cacheKey := fmt.Sprintf("ddg:%s", query)
+		var resp *websearch.Response
+		if h.searchCache != nil {
+			if cached, ok := h.searchCache.GetOrLoad(cacheKey); ok {
+				resp = &cached
+			}
+		}
+		if resp == nil {
+			if r, err := h.webSearcher.Search(ctx, query, 8); err == nil {
+				resp = r
+				if h.adaptive != nil {
+					h.adaptive.recordSuccess("ddg")
+				}
+				if h.searchCache != nil {
+					h.searchCache.Set(cacheKey, *resp)
+				}
+			} else if err != nil && h.adaptive != nil && isRateLimitError(err) {
+				h.adaptive.record429("ddg")
+			}
+		}
+		if resp != nil {
+			for _, r := range resp.Results {
+				addHit(r.Title, r.URL, r.Snippet)
+			}
+		}
+	}
+
+	// SearXNG Search with cache
+	if h.searxng != nil && h.searxng.Enabled() {
+		cacheKey := fmt.Sprintf("searxng:%s", query)
+		var resp *websearch.Response
+		if h.searchCache != nil {
+			if cached, ok := h.searchCache.GetOrLoad(cacheKey); ok {
+				resp = &cached
+			}
+		}
+		if resp == nil {
+			if r, err := h.searxng.Search(ctx, query); err == nil {
+				resp = &r
+				if h.adaptive != nil {
+					h.adaptive.recordSuccess("searxng")
+				}
+				if h.searchCache != nil {
+					h.searchCache.Set(cacheKey, *resp)
+				}
+			} else if err != nil && h.adaptive != nil && isRateLimitError(err) {
+				h.adaptive.record429("searxng")
+			}
+		}
+		if resp != nil {
 			for _, r := range resp.Results {
 				addHit(r.Title, r.URL, r.Snippet)
 			}
@@ -1119,6 +1288,50 @@ func sortedEvidence(m map[string]evidence) []evidence {
 	return out
 }
 
+// cachedToParallelSearch converts a cached websearch.Response to a
+// parallel.SearchResponse (for in-memory cache hits).
+func (h *handlers) cachedToParallelSearch(cached websearch.Response) *parallel.SearchResponse {
+	if len(cached.Results) == 0 {
+		return nil
+	}
+	res := &parallel.SearchResponse{
+		SearchID:  "cached",
+		SessionID: "deep-research",
+		Results:   make([]parallel.SearchResult, 0, len(cached.Results)),
+	}
+	for _, r := range cached.Results {
+		res.Results = append(res.Results, parallel.SearchResult{
+			Title:    r.Title,
+			URL:      r.URL,
+			Excerpts: r.Excerpts,
+		})
+	}
+	return res
+}
+
+// parallelSearchToCached converts a parallel.SearchResponse to a cached
+// websearch.Response for the in-memory TTL cache.
+func (h *handlers) parallelSearchToCached(resp *parallel.SearchResponse) websearch.Response {
+	if resp == nil || len(resp.Results) == 0 {
+		return websearch.Response{}
+	}
+	cached := websearch.Response{
+		Query:     "deep-research",
+		Backend:   "parallel",
+		Results:   make([]websearch.Result, 0, len(resp.Results)),
+		LatencyMS: 0,
+	}
+	for _, r := range resp.Results {
+		cached.Results = append(cached.Results, websearch.Result{
+			Title:    r.Title,
+			URL:      r.URL,
+			Snippet:  firstNonEmpty(r.Excerpts...),
+			Excerpts: r.Excerpts,
+		})
+	}
+	return cached
+}
+
 // normalizeURL trims trailing slashes so search hits match Extract results.
 func normalizeURL(u string) string {
 	return strings.TrimRight(strings.TrimSpace(u), "/")
@@ -1172,9 +1385,22 @@ func (r ResearchConfig) timeout() time.Duration {
 	return 5 * time.Minute
 }
 
+// isRateLimitError checks if an error indicates a rate limit (429) response.
+func isRateLimitError(err error) bool {
+	var apiErr *parallel.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusTooManyRequests
+	}
+	// Check for DDG stealth 429-like errors (bot challenge detection)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+		return true
+	}
+	return false
+}
+
 // searchBackendConfigured reports whether the native Layer B harness has at
-// least one usable search backend: a keyed Parallel search, or the keyless
-// stealth searcher (hermes sidecar).
+// least one usable search backend: a keyed Parallel search, the keyless
+// stealth searcher (hermes sidecar), or a SearXNG instance.
 func (h *handlers) searchBackendConfigured() bool {
-	return (h.parallel != nil && h.parallel.Enabled()) || h.webSearcher != nil
+	return (h.parallel != nil && h.parallel.Enabled()) || h.webSearcher != nil || (h.searxng != nil && h.searxng.Enabled())
 }

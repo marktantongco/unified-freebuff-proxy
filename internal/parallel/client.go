@@ -41,8 +41,30 @@ func New(baseURL, apiKey string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		apiKey:  apiKey,
-		http:    &http.Client{Timeout: 45 * time.Second},
+		http: &http.Client{
+			Timeout: 45 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
+}
+
+// NewWithTimeout creates a Parallel client with a custom overall HTTP timeout
+// (useful for SSE streams that need longer than the default 45s).
+func NewWithTimeout(baseURL, apiKey string, timeout time.Duration) *Client {
+	c := New(baseURL, apiKey)
+	c.http = &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     5 * time.Minute,
+		},
+	}
+	return c
 }
 
 // Configured reports whether the client has a base URL. Unlike Enabled() it
@@ -265,21 +287,54 @@ func (c *Client) GetTaskRunResult(ctx context.Context, runID string) (*TaskRunRe
 }
 
 // TaskEvents opens the SSE event stream for a run; the caller owns the
-// returned *http.Response body.
+// returned *http.Response body. Uses a 5-min timeout client so long streams
+// do not abort at the default 45s deadline.
 func (c *Client) TaskEvents(ctx context.Context, runID string) (*http.Response, error) {
 	if !c.Configured() {
 		return nil, ErrNotConfigured
 	}
-	return c.raw(ctx, http.MethodGet, "/v1/tasks/runs/"+url.PathEscape(runID)+"/events", nil, "")
+	return c.rawStream(ctx, http.MethodGet, "/v1/tasks/runs/"+url.PathEscape(runID)+"/events", nil, "")
 }
 
 // Responses performs a raw passthrough to POST /v1/responses. The returned
 // *http.Response body is undrained so stream:true bodies relay verbatim.
+// Uses a 5-min timeout client so long streams do not abort at the default 45s
+// deadline.
 func (c *Client) Responses(ctx context.Context, body []byte) (*http.Response, error) {
 	if !c.Configured() {
 		return nil, ErrNotConfigured
 	}
-	return c.raw(ctx, http.MethodPost, "/v1/responses", body, "application/json")
+	return c.rawStream(ctx, http.MethodPost, "/v1/responses", body, "application/json")
+}
+
+// rawStream performs a passthrough request with a dedicated 5-min timeout
+// transport for SSE streams. The caller owns the returned *http.Response body.
+func (c *Client) rawStream(ctx context.Context, method, path string, body []byte, contentType string) (*http.Response, error) {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rd)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		httpReq.Header.Set("x-api-key", c.apiKey)
+	}
+	if contentType != "" {
+		httpReq.Header.Set("Content-Type", contentType)
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     5 * time.Minute,
+	}
+	client := &http.Client{
+		Timeout:   5 * time.Minute,
+		Transport: transport,
+	}
+	return client.Do(httpReq)
 }
 
 // HasKey reports whether the client carries credentials (nil-safe).

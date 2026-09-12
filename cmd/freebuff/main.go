@@ -275,6 +275,22 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		webSearcher = websearch.New(hermesClient)
 	}
 
+	// SearXNG keyless search backend (optional). Instance URL from
+	// SEARXNG_URL env or config; empty = disabled, log + continue.
+	searxngURL := cfg.Stealth.SearxngURL
+	if searxngURL == "" {
+		searxngURL = os.Getenv("SEARXNG_URL")
+	}
+	var searxng *websearch.SearxngSearcher
+	if searxngURL != "" {
+		searxng = websearch.NewSearxngSearcher(searxngURL)
+		logger.Printf("searxng search enabled: %s", searxngURL)
+	}
+
+	// Search cache: 15-min in-memory TTL + 24h best-effort file persistence.
+	searchCache := websearch.NewCache(15*time.Minute, websearch.CacheDir())
+	logger.Printf("search cache enabled: memory 15m + file 24h (%s)", websearch.CacheDir())
+
 	// ── Proxy-pool auto-refresher (tests & hot-swaps SOCKS5 pool) ──────────
 	var poolRefresher *stealth.Refresher
 	if cfg.Stealth.AutoRefreshPool && hermesClient != nil && usProxyPool != nil {
@@ -333,6 +349,8 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		Research:          researchConfig(cfg),
 		Limiter:           limiter,
 		WebSearcher:       webSearcher,
+		Searxng:           searxng,
+		SearchCache:       searchCache,
 		Stealth:           stealthMetrics,
 		Refresher: func() map[string]any {
 			if poolRefresher == nil {
