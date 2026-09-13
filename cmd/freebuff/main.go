@@ -469,6 +469,12 @@ var (
 )
 
 func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[string]any {
+	// USProxyPool methods dereference internal mutex state; guard the nil
+	// case so /healthz works when the pool is disabled (us_proxies: []).
+	poolSize := 0
+	if usProxyPool != nil {
+		poolSize = usProxyPool.Size()
+	}
 	body := map[string]any{
 		"session_id": "freebuff-unified",
 		"version":    "unified-v1",
@@ -477,7 +483,7 @@ func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[strin
 			"freebuff_gateway": map[string]any{"port": 18080, "status": "active"},
 			"hermes_sidecar":   map[string]any{"port": 3101, "status": "active"},
 			"lmarena_sidecar":  map[string]any{"port": 3103, "status": "active"},
-			"us_socks5_pool":   usProxyPool.Size(),
+			"us_socks5_pool":   poolSize,
 		},
 	}
 	if n := len(cfg.Auth.APIKeys); n > 0 {
