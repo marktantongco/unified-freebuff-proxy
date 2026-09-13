@@ -65,6 +65,7 @@ type handlers struct {
 	hermes            *hermes.Client
 	lmarena           *lmarena.Client
 	evals             *eval.Store
+	board             *lmarena.Leaderboard
 	parallel          *parallel.Client
 	parallelMode      string
 	parallelProcessor string

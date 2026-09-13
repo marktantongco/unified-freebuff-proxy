@@ -57,7 +57,8 @@ type Eval struct {
 	Rounds    []Round   `json:"rounds"`
 }
 
-// Score tallies wins per side and, for revealed rounds, per model.
+// Score tallies wins per side and, for revealed rounds, per model plus
+// Bradley-Terry Elo-scale ratings (arena-rank methodology, ties split).
 type Score struct {
 	Rounds int                   `json:"rounds"`
 	Voted  int                   `json:"voted"`
@@ -65,6 +66,7 @@ type Score struct {
 	WinsB  int                   `json:"wins_b"`
 	Ties   int                   `json:"ties"`
 	Models map[string]ModelScore `json:"models,omitempty"`
+	BT     map[string]float64    `json:"bt_ratings,omitempty"`
 }
 
 // ModelScore is the revealed per-model tally.
@@ -118,6 +120,7 @@ func ScoreOf(e Eval) Score {
 			s.Models[r.ModelB] = b
 		}
 	}
+	s.BT = btRatings(btMatchesOf(e))
 	return s
 }
 

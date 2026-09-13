@@ -2,8 +2,11 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"time"
 
 	"freebuff-unified/internal/eval"
 	"github.com/gofiber/fiber/v3"
@@ -106,6 +109,83 @@ func (h *handlers) EvalVote(c fiber.Ctx) error {
 		return c.Status(status).JSON(errBody("invalid_request", err.Error()))
 	}
 	return c.Status(http.StatusOK).JSON(blindRound(r))
+}
+
+// EvalImport bulk-pastes rounds. Body: {"format": "jsonl"|"csv", "data":
+// "<raw records>"}. Rounds with model labels seal; records carrying a
+// winner arrive pre-voted. Bounded to eval.maxImportRecords per call.
+func (h *handlers) EvalImport(c fiber.Ctx) error {
+	if h.evals == nil {
+		return c.Status(http.StatusServiceUnavailable).JSON(errBody("evals_disabled", "eval harness is not enabled"))
+	}
+	var req struct {
+		Format string `json:"format"`
+		Data   string `json:"data"`
+	}
+	if !decodeEvalJSON(c, &req) {
+		return c.Status(http.StatusBadRequest).JSON(errBody("invalid_request", `body must be JSON with format "jsonl"|"csv" and data`))
+	}
+	var (
+		recs []eval.ImportRecord
+		err  error
+	)
+	switch req.Format {
+	case "jsonl":
+		recs, err = eval.ParseJSONL(req.Data)
+	case "csv":
+		recs, err = eval.ParseCSV(req.Data)
+	default:
+		return c.Status(http.StatusBadRequest).JSON(errBody("invalid_request", `format must be "jsonl" or "csv"`))
+	}
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(errBody("invalid_request", err.Error()))
+	}
+	rounds, err := h.evals.Import(c.Params("id"), recs)
+	if err != nil {
+		status := http.StatusBadRequest
+		if err.Error() == "eval not found" {
+			status = http.StatusNotFound
+		}
+		return c.Status(status).JSON(errBody("invalid_request", err.Error()))
+	}
+	ids := make([]string, len(rounds))
+	for i, r := range rounds {
+		ids[i] = r.ID
+	}
+	return c.Status(http.StatusCreated).JSON(map[string]any{"imported": len(rounds), "round_ids": ids})
+}
+
+// Leaderboard serves the public text-leaderboard snapshot
+// (GET /v1/lmarena/leaderboard?category=overall&top=5). Read-only HF data,
+// cached 24h by default; stale cache covers HF downtime. The fetch runs on
+// a detached context: client disconnect must not abort a 100-page refresh
+// other requests may be waiting on.
+func (h *handlers) Leaderboard(c fiber.Ctx) error {
+	if h.board == nil {
+		return c.Status(http.StatusServiceUnavailable).JSON(errBody("leaderboard_disabled", "leaderboard snapshot is not enabled"))
+	}
+	category := c.Query("category", "overall")
+	top := 0
+	if raw := c.Query("top", ""); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return c.Status(http.StatusBadRequest).JSON(errBody("invalid_request", "top must be a positive integer"))
+		}
+		if n > 200 {
+			n = 200
+		}
+		top = n
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 3*time.Minute)
+	defer cancel()
+	snap, err := h.board.Get(ctx, category)
+	if err != nil {
+		return c.Status(http.StatusBadGateway).JSON(errBody("leaderboard_unavailable", err.Error()))
+	}
+	if top > 0 && len(snap.Entries) > top {
+		snap.Entries = snap.Entries[:top]
+	}
+	return c.Status(http.StatusOK).JSON(snap)
 }
 
 // EvalReveal unseals model labels and returns the full eval plus score.
