@@ -1,0 +1,100 @@
+# freebuff-unified example configuration.
+# Copy to config.yaml and fill in real values. Secrets belong in the
+# environment (see PARALLEL_API_KEY handling) — do not commit config.yaml.
+
+server:
+  listen: ":18080"
+  # First key is also used as the ProxyAPIKey for client auth (Bearer or x-api-key).
+  api_keys:
+    - "fbu_CHANGE_ME_client_key_1"
+    - "fbu_CHANGE_ME_client_key_2"
+
+upstream:
+  base_url: "https://www.codebuff.com"
+  cost_mode: "free"
+  default_model: "deepseek/deepseek-v4-pro"
+
+auth:
+  # Auth-gate keys (client-facing). Keep in sync with server.api_keys or
+  # migrate to a single block — see planning/2026-09-09-unification-audit.md.
+  api_keys:
+    - "fbu_CHANGE_ME_client_key_1"
+    - "fbu_CHANGE_ME_client_key_2"
+  dir: "auths"
+  breaker:
+    threshold: 3
+    cooldown: 12h
+
+stealth:
+  strip_headers: true
+  enabled: true
+  auto_refresh_pool: true
+  proxy_refresh_mins: 30
+  max_pool_proxies: 12
+  profile: "chrome120"
+  # US SOCKS5 egress pool (round-robin). Generate candidates with
+  # scripts/fetch-proxies.sh and validate with scripts/test-proxies.sh.
+  us_proxies:
+    - "socks5://REPLACE_ME_HOST_1:1080"
+    - "socks5://REPLACE_ME_HOST_2:1080"
+  # SearXNG keyless search backend (optional).
+  # searxng_url: "http://127.0.0.1:8888"
+  # Set SEARXNG_URL env to override
+
+limits:
+  global_rpm: 120
+  account_rpm: 30
+  client_rpm: 60
+
+# Backend freebuff-proxy reporting + optional front-door passthrough.
+#   mode: unset or "report"      -> native path serves /v1/* (default)
+#   mode: "passthrough"          -> /v1/* relayed byte-level to backend_url
+#                                   (native /v1 routes disabled; /healthz stays native)
+proxy:
+  enabled: true
+  backend_url: "http://127.0.0.1:3457"
+  # mode: "passthrough"
+
+dashboard:
+  enabled: true
+  addr: "127.0.0.1:9091"   # bind loopback unless you gate it behind auth
+  prefix: "/dashboard"
+
+# Hermes stealth sidecar (vendored under deps/hermes, served by
+# deps/hermes-service/service.js on :3101).
+hermes:
+  enabled: true
+  base_url: "http://127.0.0.1:3101"
+
+# LMArena stealth proxy sidecar (vendored under deps/lmarena-stealth-proxy,
+# served by index.js on :3103; :3102 stays reserved for a second hermes).
+# Gateway relays POST /v1/lmarena/v1/responses + session CRUD; sidecar owns
+# sessions and per-session rate limits. Key-protected like /v1/*.
+lmarena:
+  enabled: true
+  base_url: "http://127.0.0.1:3103"
+  # Manual-eval harness store (blind A/B paste + score, no upstream fetch).
+  # Pasted outputs are user data — keep untracked, like auths/.
+  eval_dir: "evals"
+
+parallel:
+  enabled: true
+  base_url: "https://api.parallel.ai"
+  default_mode: "fast"
+  default_processor: "pro-fast"
+  # api_key: read from PARALLEL_API_KEY env when omitted. Optional — the
+  # gateway is keyless-first: /v1/deep-research (Layer A Task runs) and
+  # /v1/responses are attempted without a key and fall back to the native
+  # harness when the API rejects the call.
+
+# Native /v1/deep-research Layer B harness (used as the automatic fallback
+# when Layer A is unavailable or keyless Task creation is rejected).
+research:
+  enabled: true
+  max_queries: 5
+  fan_out: 8
+  extract_per_query: 3
+  timeout_ms: 300000
+
+logging:
+  level: "info"

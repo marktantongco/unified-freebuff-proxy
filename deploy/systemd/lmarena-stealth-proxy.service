@@ -1,0 +1,17 @@
+[Unit]
+Description=LMArena Stealth Proxy sidecar (lmarena.ai REST API for freebuff-unified)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/x3/freebuff-unified/deps/lmarena-stealth-proxy
+ExecStart=/usr/bin/node /home/x3/freebuff-unified/deps/lmarena-stealth-proxy/index.js
+Environment=PORT=3103
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
