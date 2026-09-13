@@ -2,9 +2,11 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"freebuff-unified/internal/eval"
 	"github.com/gofiber/fiber/v3"
@@ -155,7 +157,9 @@ func (h *handlers) EvalImport(c fiber.Ctx) error {
 
 // Leaderboard serves the public text-leaderboard snapshot
 // (GET /v1/lmarena/leaderboard?category=overall&top=5). Read-only HF data,
-// cached 24h by default; stale cache covers HF downtime.
+// cached 24h by default; stale cache covers HF downtime. The fetch runs on
+// a detached context: client disconnect must not abort a 100-page refresh
+// other requests may be waiting on.
 func (h *handlers) Leaderboard(c fiber.Ctx) error {
 	if h.board == nil {
 		return c.Status(http.StatusServiceUnavailable).JSON(errBody("leaderboard_disabled", "leaderboard snapshot is not enabled"))
@@ -172,7 +176,9 @@ func (h *handlers) Leaderboard(c fiber.Ctx) error {
 		}
 		top = n
 	}
-	snap, err := h.board.Get(c.Context(), category)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 3*time.Minute)
+	defer cancel()
+	snap, err := h.board.Get(ctx, category)
 	if err != nil {
 		return c.Status(http.StatusBadGateway).JSON(errBody("leaderboard_unavailable", err.Error()))
 	}

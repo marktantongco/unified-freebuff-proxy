@@ -49,12 +49,14 @@ type Snapshot struct {
 // Leaderboard fetches and caches snapshots. Zero value is disabled;
 // construct with NewLeaderboard.
 type Leaderboard struct {
-	mu      sync.Mutex
-	dir     string
-	base    string
-	dataset string
-	refresh time.Duration
-	client  *http.Client
+	mu       sync.Mutex
+	cond     *sync.Cond
+	inflight bool
+	dir      string
+	base     string
+	dataset  string
+	refresh  time.Duration
+	client   *http.Client
 }
 
 // NewLeaderboard builds a snapshot source. Empty dir disables disk cache
@@ -63,13 +65,15 @@ func NewLeaderboard(dir, base string, refresh time.Duration) *Leaderboard {
 	if base == "" {
 		base = DefaultDatasetsServer
 	}
-	return &Leaderboard{
+	lb := &Leaderboard{
 		dir:     dir,
 		base:    base,
 		dataset: DefaultLeaderboardDataset,
 		refresh: refresh,
 		client:  &http.Client{Timeout: 30 * time.Second},
 	}
+	lb.cond = sync.NewCond(&lb.mu)
+	return lb
 }
 
 func (l *Leaderboard) cachePath(category string) string {
@@ -113,27 +117,75 @@ func (l *Leaderboard) Cached(category string) (Snapshot, bool) {
 }
 
 // Get returns the category snapshot, refreshing when the cache is older
-// than Refresh. A failed refresh falls back to stale cache; with neither,
-// it returns the fetch error.
+// than Refresh. The fetch runs outside the lock so concurrent requests
+// share one refresh via an in-flight flag instead of queueing behind a
+// 100-page download. A failed refresh falls back to stale cache; with
+// neither, it returns the fetch error.
 func (l *Leaderboard) Get(ctx context.Context, category string) (Snapshot, error) {
 	if category == "" {
 		category = "overall"
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	cached, ok := l.loadCache(category)
-	if ok && l.refresh > 0 && time.Since(cached.FetchedAt) < l.refresh {
+	if cached, ok := l.loadCache(category); ok && l.refresh > 0 && time.Since(cached.FetchedAt) < l.refresh {
+		l.mu.Unlock()
 		return cached, nil
 	}
+	if l.inflight {
+		// Another request is refreshing: serve whatever cache exists
+		// (even stale) rather than stampeding HF.
+		cached, ok := l.loadCache(category)
+		l.mu.Unlock()
+		if ok {
+			return cached, nil
+		}
+		// Cold + refresh in flight: wait for it, then read cache.
+		return l.waitRefresh(ctx, category)
+	}
+	l.inflight = true
+	l.mu.Unlock()
+
 	snap, err := l.fetch(ctx, category)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	// Save under lock and broadcast after: waiters woken below are
+	// guaranteed to see the fresh cache.
 	if err != nil {
+		cached, ok := l.loadCache(category)
+		l.inflight = false
+		l.cond.Broadcast()
 		if ok {
 			return cached, nil
 		}
 		return Snapshot{}, err
 	}
 	l.saveCache(snap)
+	l.inflight = false
+	l.cond.Broadcast()
 	return snap, nil
+}
+
+// waitRefresh blocks until the in-flight refresh finishes, then serves
+// cache (fresh or stale). Context cancel aborts the wait, not the fetch.
+func (l *Leaderboard) waitRefresh(ctx context.Context, category string) (Snapshot, error) {
+	done := make(chan struct{})
+	go func() {
+		l.mu.Lock()
+		for l.inflight {
+			l.cond.Wait()
+		}
+		l.mu.Unlock()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return Snapshot{}, ctx.Err()
+	case <-done:
+		if cached, ok := l.loadCache(category); ok {
+			return cached, nil
+		}
+		return Snapshot{}, fmt.Errorf("leaderboard: refresh produced no cache")
+	}
 }
 
 // rowsPage mirrors the datasets-server /rows envelope.
@@ -170,6 +222,9 @@ func str(v any) string {
 func (l *Leaderboard) fetch(ctx context.Context, category string) (Snapshot, error) {
 	const pageLen = 100
 	const workers = 8
+	// maxPages bounds a runaway server that never returns a short page
+	// (4x the current ~10k-row split).
+	const maxPages = 400
 	var (
 		mu       sync.Mutex
 		all      []map[string]any
@@ -216,6 +271,10 @@ func (l *Leaderboard) fetch(ctx context.Context, category string) (Snapshot, err
 					return
 				}
 				off := int(next.Add(pageLen) - pageLen)
+				if off/pageLen >= maxPages {
+					done.Store(true)
+					return
+				}
 				rows, err := fetchPage(off)
 				if err != nil {
 					mu.Lock()
