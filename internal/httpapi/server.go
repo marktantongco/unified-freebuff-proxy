@@ -149,6 +149,18 @@ func NewApp(opts Options) *fiber.App {
 	app.Get("/v1/lmarena/leaderboard", handlers.Leaderboard)
 	app.All("/v1/lmarena/*", newLMArenaRelay(opts.LMArena, nil))
 
+	// Sidecar-native surfaces: hermes stealth, parallel search/extract.
+	// Registered before the front-door relay so they stay native in both
+	// modes (like /v1/responses and /v1/lmarena/*): the freebuff-proxy
+	// backend does not own these sidecars, so relaying them there 404s.
+	app.Get("/hermes/healthz", handlers.HermesHealth)
+	app.Get("/stealth/status", handlers.StealthStatus)
+	app.Post("/v1/hermes/fetch", handlers.HermesFetch)
+	app.Post("/v1/hermes/session/:id", handlers.HermesSessionFetch)
+	app.Delete("/v1/hermes/session/:id", handlers.HermesSessionDelete)
+	app.Post("/v1/parallel/search", handlers.ParallelSearch)
+	app.Post("/v1/parallel/extract", handlers.ParallelExtract)
+
 	if opts.Passthrough != nil {
 		// Front-door mode: /v1/* is relayed verbatim to the freebuff-proxy
 		// backend (its sessions, token pool, and dashboard do the protocol
@@ -162,17 +174,6 @@ func NewApp(opts Options) *fiber.App {
 	app.Post("/v1/chat/completions", handlers.ChatCompletions)
 	app.Post("/v1/messages", handlers.AnthropicMessages)
 	app.Post("/v1/messages/count_tokens", handlers.AnthropicCountTokens)
-
-	// Hermes stealth sidecar (key-protected, auth middleware above).
-	app.Get("/hermes/healthz", handlers.HermesHealth)
-	app.Get("/stealth/status", handlers.StealthStatus)
-	app.Post("/v1/hermes/fetch", handlers.HermesFetch)
-	app.Post("/v1/hermes/session/:id", handlers.HermesSessionFetch)
-	app.Delete("/v1/hermes/session/:id", handlers.HermesSessionDelete)
-
-	// Parallel Web APIs (key-protected, auth middleware above).
-	app.Post("/v1/parallel/search", handlers.ParallelSearch)
-	app.Post("/v1/parallel/extract", handlers.ParallelExtract)
 
 	return app
 }

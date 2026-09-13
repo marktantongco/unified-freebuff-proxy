@@ -40,6 +40,40 @@ func TestPassthroughModeRelaysV1AndKeepsNativeHealth(t *testing.T) {
 	}
 }
 
+func TestPassthroughModeKeepsSidecarRoutesNative(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"backend":"marker"}`))
+	}))
+	t.Cleanup(backend.Close)
+
+	app := NewApp(Options{
+		Passthrough: proxy.NewHandler(nil),
+		BackendURL:  backend.URL,
+	})
+
+	// Sidecar-native routes must not reach the backend: with no sidecar
+	// clients wired they answer natively (503 disabled / 404 JSON), never
+	// the backend marker.
+	for _, path := range []string{"/stealth/status", "/hermes/healthz"} {
+		resp, err := app.Test(httptest.NewRequest(http.MethodGet, path, nil))
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		body := readAll(t, resp)
+		if strings.Contains(body, "marker") {
+			t.Fatalf("%s relayed to backend, want native handler", path)
+		}
+	}
+	resp, err := app.Test(httptest.NewRequest(http.MethodPost, "/v1/hermes/fetch",
+		strings.NewReader(`{"url":"http://example.com"}`)))
+	if err != nil {
+		t.Fatalf("hermes fetch: %v", err)
+	}
+	if strings.Contains(readAll(t, resp), "marker") {
+		t.Fatal("/v1/hermes/fetch relayed to backend, want native handler")
+	}
+}
+
 func TestDefaultModeKeepsNativeRoutes(t *testing.T) {
 	app := NewApp(Options{Chat: okChatService{}})
 
