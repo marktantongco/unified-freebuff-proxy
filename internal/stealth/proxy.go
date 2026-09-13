@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,14 +20,25 @@ import (
 
 // ProxyEntry is a single SOCKS5 proxy with credentials.
 type ProxyEntry struct {
-	Host     string    `json:"host"`
-	Port     int       `json:"port"`
-	User     string    `json:"user,omitempty"`
-	Pass     string    `json:"-"`
-	Country  string    `json:"country,omitempty"`
-	LastUsed time.Time `json:"last_used"`
-	Failures int       `json:"failures"`
-	Alive    bool      `json:"alive"`
+	Host     string        `json:"host"`
+	Port     int           `json:"port"`
+	User     string        `json:"user,omitempty"`
+	Pass     string        `json:"-"`
+	Country  string        `json:"country,omitempty"`
+	Latency  time.Duration `json:"latency_ms"` // TCP connect RTT from the last health check
+	LastUsed time.Time     `json:"last_used"`
+	Failures int           `json:"failures"`
+	Alive    bool          `json:"alive"`
+}
+
+// MarshalJSON renders Latency in milliseconds so the JSON output honors
+// the latency_ms tag (time.Duration would otherwise serialize nanoseconds).
+func (p *ProxyEntry) MarshalJSON() ([]byte, error) {
+	type alias ProxyEntry
+	return json.Marshal(struct {
+		*alias
+		Latency int64 `json:"latency_ms"`
+	}{alias: (*alias)(p), Latency: p.Latency.Milliseconds()})
 }
 
 // URL returns the SOCKS5 URL for this proxy entry.
@@ -38,12 +50,14 @@ func (p *ProxyEntry) URL() string {
 }
 
 // Dialer returns a proxy.Dialer for this entry.
+// The forward TCP dialer carries a 10s timeout so a dead proxy address
+// cannot hang the connect indefinitely.
 func (p *ProxyEntry) Dialer() (proxy.Dialer, error) {
 	u, err := url.Parse(p.URL())
 	if err != nil {
 		return nil, err
 	}
-	return proxy.FromURL(u, proxy.Direct)
+	return proxy.FromURL(u, &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second})
 }
 
 // ProxyPool manages a rotating pool of SOCKS5 proxies with background refresh.
@@ -166,11 +180,19 @@ func (p *ProxyPool) Refresh(ctx context.Context) error {
 		if p.strictGeo {
 			return fmt.Errorf("proxy pool: no healthy US proxies after refresh (strict_geo)")
 		}
+		// Keep entries for observability but marked dead. Next() then returns
+		// nil and callers fall back to direct egress.
 		healthy = entries
 		for _, e := range healthy {
 			e.Alive = false
 		}
 	}
+
+	// Latency-score the pool: fastest proxies first. Round-robin still rotates
+	// every healthy entry, but starts from the fastest.
+	sort.Slice(healthy, func(i, j int) bool {
+		return healthy[i].Latency < healthy[j].Latency
+	})
 
 	p.mu.Lock()
 	p.proxies = healthy
@@ -182,6 +204,13 @@ func (p *ProxyPool) Refresh(ctx context.Context) error {
 }
 
 // Next returns the next healthy proxy in round-robin order.
+//
+// The pool is latency-sorted at refresh time (fastest first), so round-robin
+// starts at the fastest proxy while still rotating egress IPs.
+//
+// Returns nil when the pool is empty or every proxy is dead (fail-closed).
+// Callers should fall back to direct egress — far faster than hanging on a
+// dead public proxy.
 func (p *ProxyPool) Next() *ProxyEntry {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -199,9 +228,8 @@ func (p *ProxyPool) Next() *ProxyEntry {
 		}
 	}
 
-	entry := p.proxies[0]
-	entry.LastUsed = time.Now()
-	return entry
+	// All proxies are dead or unhealthy — fail closed (nil = direct fallback).
+	return nil
 }
 
 // MarkFailure increments the failure count for the given proxy.
@@ -267,14 +295,23 @@ func (p *ProxyPool) Len() int {
 
 func (p *ProxyPool) healthCheck(entry *ProxyEntry) bool {
 	addr := net.JoinHostPort(entry.Host, fmt.Sprintf("%d", entry.Port))
+	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
 		return false
 	}
+	entry.Latency = time.Since(start)
 	conn.Close()
 	return true
 }
 
+// parseProxyList parses proxy entries from text. Supported formats:
+//
+//	Webshare:        host:port:user:pass or host:port:user:pass:country
+//	Public lists:    host:port            (monosans/proxy-list, TheSpeedX/SOCKS-List)
+//	Scheme-prefixed: socks5://host:port   (socks4://, http:// are skipped)
+//
+// Lines starting with # are comments.
 func parseProxyList(data string) []*ProxyEntry {
 	var entries []*ProxyEntry
 	for _, line := range strings.Split(data, "\n") {
@@ -282,20 +319,43 @@ func parseProxyList(data string) []*ProxyEntry {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		parts := strings.Split(line, ":")
-		if len(parts) < 4 {
+		// Strip an optional scheme prefix; skip entries on non-socks5 schemes.
+		skip := false
+		for _, scheme := range []string{"socks5://", "socks4://", "http://", "https://"} {
+			if strings.HasPrefix(line, scheme) {
+				skip = scheme != "socks5://"
+				line = strings.TrimPrefix(line, scheme)
+				break
+			}
+		}
+		if skip {
 			continue
 		}
-		entry := &ProxyEntry{
-			Host: parts[0],
-			Port: parseInt(parts[1]),
-			User: parts[2],
-			Pass: parts[3],
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-		if len(parts) >= 5 {
-			entry.Country = strings.TrimSpace(parts[4])
+		parts := strings.Split(line, ":")
+		switch {
+		case len(parts) >= 4:
+			// Webshare format: host:port:user:pass[:country]
+			entry := &ProxyEntry{
+				Host: parts[0],
+				Port: parseInt(parts[1]),
+				User: parts[2],
+				Pass: parts[3],
+			}
+			if len(parts) >= 5 {
+				entry.Country = strings.TrimSpace(parts[4])
+			}
+			entries = append(entries, entry)
+		case len(parts) == 2:
+			// Plain public-list format: host:port
+			entries = append(entries, &ProxyEntry{
+				Host: parts[0],
+				Port: parseInt(parts[1]),
+			})
 		}
-		entries = append(entries, entry)
 	}
 	return entries
 }

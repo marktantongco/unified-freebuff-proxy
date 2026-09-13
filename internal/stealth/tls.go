@@ -4,11 +4,18 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/proxy"
 )
+
+// tlsHandshakeTimeout bounds the utls handshake. Because the transport uses
+// DialTLSContext, http.Transport's TLSHandshakeTimeout does not apply here —
+// the handshake happens inside this dialer, so we budget it ourselves.
+const tlsHandshakeTimeout = 10 * time.Second
 
 // dialer implements a DialTLSContext function that uses utls to impersonate a browser TLS fingerprint.
 type dialer struct {
@@ -26,29 +33,38 @@ func (d *dialer) Dial(ctx context.Context, network, addr string) (net.Conn, erro
 
 	if d.proxyPool != nil {
 		entry := d.proxyPool.Next()
-		if entry == nil {
-			return nil, fmt.Errorf("stealth: no SOCKS5 proxies available in pool")
-		}
-		proxyEntry = entry
+		if entry != nil {
+			proxyEntry = entry
 
-		proxyDialer, dialErr := entry.Dialer()
-		if dialErr != nil {
-			d.proxyPool.MarkFailure(entry)
-			return nil, fmt.Errorf("stealth: create SOCKS5 dialer: %w", dialErr)
+			proxyDialer, dialErr := entry.Dialer()
+			if dialErr != nil {
+				d.proxyPool.MarkFailure(entry)
+				proxyEntry = nil
+				log.Printf("[stealth] create SOCKS5 dialer failed (%s:%d): %v — falling back to direct", entry.Host, entry.Port, dialErr)
+			} else {
+				// Prefer the context-aware dial so caller deadlines and the					// proxy entry's forward-dial timeout both apply.
+					if cd, ok := proxyDialer.(proxy.ContextDialer); ok {
+						rawConn, err = cd.DialContext(ctx, network, addr)
+					} else {
+						rawConn, err = proxyDialer.Dial(network, addr)
+					}
+					if err != nil {
+						d.proxyPool.MarkFailure(entry)
+						proxyEntry = nil // failed proxy must not receive MarkSuccess below
+						log.Printf("[stealth] SOCKS5 proxy dial to %s failed: %v — falling back to direct", addr, err)
+					}
+			}
+		} else {
+			log.Printf("[stealth] proxy pool exhausted — falling back to direct for %s", addr)
 		}
+	}
 
-		rawConn, err = proxyDialer.Dial(network, addr)
-		if err != nil {
-			d.proxyPool.MarkFailure(entry)
-			return nil, fmt.Errorf("stealth: SOCKS5 proxy dial to %s failed: %w", addr, err)
-		}
-	} else {
+	if rawConn == nil {
 		dialFN := d.resolveFN
 		if dialFN == nil {
 			dialFN = (&net.Dialer{
-				Timeout:   30 * time.Second,
+				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
-				DualStack: true,
 			}).DialContext
 		}
 		rawConn, err = dialFN(ctx, network, addr)
@@ -84,7 +100,11 @@ func (d *dialer) Dial(ctx context.Context, network, addr string) (net.Conn, erro
 		}
 	}
 
-	if err := uConn.HandshakeContext(ctx); err != nil {
+	// Perform the TLS handshake with a bounded budget so a stalled
+	// proxy or server cannot hang the request for the full client timeout.
+	hsCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
+	defer cancel()
+	if err := uConn.HandshakeContext(hsCtx); err != nil {
 		rawConn.Close()
 		if proxyEntry != nil {
 			d.proxyPool.MarkFailure(proxyEntry)

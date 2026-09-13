@@ -6,11 +6,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -24,6 +27,18 @@ const (
 	freebuffCostMode             = "free"
 	defaultFreeAgentID           = "base2-free"
 	defaultResponseHeaderTimeout = 30 * time.Second
+
+	// defaultTLSHandshakeTimeout bounds the TLS handshake on the direct path.
+	// Also mirrors the intent of a per-attempt budget: dial + TLS + headers
+	// each get their own ceiling instead of one giant 180s client timeout.
+	defaultTLSHandshakeTimeout = 10 * time.Second
+)
+
+// transport-level retry tuning for doJSONRequest (transport errors only).
+// maxTransportAttempts is the TOTAL number of sends (initial + 1 retry).
+const (
+	maxTransportAttempts = 2
+	transportRetryDelay  = 200 * time.Millisecond
 )
 
 var freebuffAgentIDsByModel = map[string]string{
@@ -126,6 +141,11 @@ func (c *Client) UseTransport(httpClient *http.Client) {
 func defaultHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	// Raise per-host idle pool above Go's default of 2 to prevent TLS
+	// handshake storms under concurrent load.
+	transport.MaxIdleConnsPerHost = 100
+	transport.TLSHandshakeTimeout = defaultTLSHandshakeTimeout
+	transport.ExpectContinueTimeout = 1 * time.Second
 	return &http.Client{Transport: transport}
 }
 
@@ -483,27 +503,74 @@ func (c *Client) doJSONRequest(ctx context.Context, token string, path string, p
 		return nil, chatEncodeError()
 	}
 
+	var lastErr error
 	requestURL := c.baseURL.ResolveReference(&url.URL{Path: path})
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("build freebuff chat request: %w", err)
-	}
 
-	httpReq.Header.Set(headerAuthorization, "Bearer "+token)
-	httpReq.Header.Set("Content-Type", "application/json")
-	if accept != "" {
-		httpReq.Header.Set("Accept", accept)
-	}
+	// Transport-level retry: transient dial/TLS/reset blips (dead proxy pick,
+	// handshake storm leftovers) are retried once with a short backoff instead
+	// of surfacing as user-visible timeouts. Never retried: HTTP status errors
+	// (only transport errors reach this path), caller cancellation/deadlines.
+	for attempt := 0; attempt < maxTransportAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(transportRetryDelay):
+			case <-ctx.Done():
+				return nil, &APIError{
+					Code:    "upstream_chat_unavailable",
+					Message: "Freebuff chat upstream request canceled",
+				}
+			}
+		}
 
-	resp, err := c.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, &APIError{
-			Code:    "upstream_chat_unavailable",
-			Message: "Freebuff chat upstream request failed",
+		// Fresh body reader per attempt: bytes.Reader is consumed by the first send.
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build freebuff chat request: %w", err)
+		}
+
+		httpReq.Header.Set(headerAuthorization, "Bearer "+token)
+		httpReq.Header.Set("Content-Type", "application/json")
+		if accept != "" {
+			httpReq.Header.Set("Accept", accept)
+		}
+
+		resp, err := c.httpClient.Do(httpReq)
+		if err == nil {
+			return resp, nil
+		}
+
+		lastErr = err
+		if !isTransportError(err) || ctx.Err() != nil {
+			break
 		}
 	}
 
-	return resp, nil
+	_ = lastErr
+	return nil, &APIError{
+		Code:    "upstream_chat_unavailable",
+		Message: "Freebuff chat upstream request failed",
+	}
+}
+
+// isTransportError reports whether err is a low-level transport failure worth
+// retrying (dial failures, TLS handshake errors, connection resets, EOF).
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Caller cancellation/deadline is never retryable.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 func failedChatStream(err error) (<-chan string, <-chan error) {
