@@ -25,9 +25,11 @@ import (
 	"freebuff-unified/internal/config"
 	"freebuff-unified/internal/credentials"
 	"freebuff-unified/internal/dashboard"
+	evalpkg "freebuff-unified/internal/eval"
 	"freebuff-unified/internal/freebuff"
 	"freebuff-unified/internal/hermes"
 	"freebuff-unified/internal/httpapi"
+	"freebuff-unified/internal/lmarena"
 	"freebuff-unified/internal/oauth"
 	"freebuff-unified/internal/parallel"
 	"freebuff-unified/internal/proxy"
@@ -104,6 +106,7 @@ func runCheck(cfg *config.Config, configPath string) {
 		cfg.Parallel.Enabled, cfg.Parallel.DefaultMode, cfg.Parallel.DefaultProcessor, keySet(cfg.Parallel.APIKey))
 	fmt.Printf("research:   enabled=%v max_queries=%d fan_out=%d timeout_ms=%d\n",
 		cfg.Research.Enabled, cfg.Research.MaxQueries, cfg.Research.FanOut, cfg.Research.TimeoutMS)
+	fmt.Printf("lmarena:    enabled=%v base=%s eval_dir=%s\n", cfg.LMArena.Enabled, cfg.LMArena.BaseURL, cfg.LMArena.EvalDir)
 }
 
 func runLogin(cfg *config.Config) error {
@@ -268,6 +271,37 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 			cfg.Parallel.BaseURL, cfg.Parallel.DefaultMode, cfg.Parallel.DefaultProcessor, keySet(parallelAPIKey))
 	}
 
+	// ── LMArena stealth proxy sidecar (deps/lmarena-stealth-proxy, :3103) ──
+	// Session-based lmarena.ai REST API. Non-blocking health check so boot
+	// never stalls when the sidecar is down (endpoints 503 until it answers).
+	var lmarenaClient *lmarena.Client
+	if cfg.LMArena.Enabled {
+		lmarenaClient = lmarena.New(cfg.LMArena.BaseURL)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if h, err := lmarenaClient.Health(ctx); err != nil {
+				logger.Printf("lmarena sidecar at %s: %v (/v1/lmarena/* will 502)", cfg.LMArena.BaseURL, err)
+			} else {
+				logger.Printf("lmarena sidecar ok: %s (uptime=%.0fs)", h.Status, h.Uptime)
+			}
+		}()
+	}
+
+	// ── Manual-eval harness (blind A/B store/score, no upstream fetch) ───
+	// Human pastes outputs; gateway only stores. Boot never fails here: a
+	// bad dir disables the endpoints (503) instead of crashing serve.
+	var evalStore *evalpkg.Store
+	if cfg.LMArena.EvalDir != "" {
+		s, err := evalpkg.NewStore(cfg.LMArena.EvalDir)
+		if err != nil {
+			logger.Printf("eval harness disabled: %v", err)
+		} else {
+			evalStore = s
+			logger.Printf("eval harness on: dir=%s", cfg.LMArena.EvalDir)
+		}
+	}
+
 	// Keyless stealth web search (DuckDuckGo via hermes sidecar) — backs
 	// /v1/parallel/search when no Parallel API key is configured.
 	var webSearcher *websearch.Searcher
@@ -341,7 +375,7 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		ProxyAPIKey: apiKey,
 		Chat:        chatService,
 		TokenPool:   tokenPool,
-		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, Parallel: parallelClient,
+		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, LMArena: lmarenaClient, EvalStore: evalStore, Parallel: parallelClient,
 		Passthrough:       passthrough,
 		BackendURL:        passthroughBackendURL(cfg),
 		ParallelMode:      cfg.Parallel.DefaultMode,
@@ -360,7 +394,7 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		},
 		ExtraHealth: func() map[string]any { return extraHealth(cfg, usProxyPool) },
 		AIStack: httpapi.ServeStaleCache(func() map[string]any {
-			return aiStackStatus(cfg, hermesClient, usProxyPool, parallelClient, webSearcher)
+			return aiStackStatus(cfg, hermesClient, lmarenaClient, usProxyPool, parallelClient, webSearcher)
 		}),
 	})
 
@@ -433,6 +467,7 @@ func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[strin
 		"ai_stack": map[string]any{
 			"freebuff_gateway": map[string]any{"port": 18080, "status": "active"},
 			"hermes_sidecar":   map[string]any{"port": 3101, "status": "active"},
+			"lmarena_sidecar":  map[string]any{"port": 3103, "status": "active"},
 			"us_socks5_pool":   usProxyPool.Size(),
 		},
 	}
@@ -451,7 +486,7 @@ func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[strin
 	return body
 }
 
-func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, usProxyPool *stealth.USProxyPool, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
+func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, lmarenaClient *lmarena.Client, usProxyPool *stealth.USProxyPool, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
 	proxyBackend := passthroughBackendURL(cfg)
 	return map[string]any{
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
@@ -477,6 +512,7 @@ func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, usProxyPool 
 				"endpoints": []string{"/healthz", "/v1/models", "/v1/chat/completions", "/proxy/verify"},
 			},
 			"hermes_stealth_sidecar": hermesStatus(cfg, hermesClient),
+			"lmarena_stealth_proxy":  lmarenaStatus(cfg, lmarenaClient),
 			"parallel_web_apis":      parallelStatus(parallelClient, webSearcher),
 		},
 		"providers": map[string]any{
@@ -517,6 +553,33 @@ func hermesStatus(cfg *config.Config, client *hermes.Client) map[string]any {
 		"node":      h.Node,
 		"sessions":  h.Sessions,
 		"endpoints": []string{"/v1/hermes/fetch", "/v1/hermes/session/:id", "/hermes/healthz"},
+	}
+}
+
+// lmarenaStatus reports the lmarena-stealth-proxy sidecar state for
+// /ai-stack/status.
+func lmarenaStatus(cfg *config.Config, client *lmarena.Client) map[string]any {
+	if !cfg.LMArena.Enabled || client == nil {
+		return map[string]any{
+			"address": cfg.LMArena.BaseURL,
+			"status":  "disabled",
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h, err := client.Health(ctx)
+	if err != nil {
+		return map[string]any{
+			"address": cfg.LMArena.BaseURL,
+			"status":  "unreachable",
+			"error":   err.Error(),
+		}
+	}
+	return map[string]any{
+		"address":   cfg.LMArena.BaseURL,
+		"status":    h.Status,
+		"uptime_s":  h.Uptime,
+		"endpoints": []string{"/v1/lmarena/v1/responses", "/v1/lmarena/v1/session", "/v1/lmarena/evals", "/lmarena/healthz"},
 	}
 }
 

@@ -11,6 +11,7 @@ config.yaml
 .env
 .env.*
 auths/
+evals/
 
 # ---- egress pools (regenerate: scripts/fetch-proxies.sh) ----
 proxies.txt
@@ -19,6 +20,10 @@ proxies.txt
 deps/freebuff2api/
 deps/hermes-service/node_modules/
 deps/hermes/dist/
+deps/lmarena-stealth-proxy/node_modules/
+# NOTE: deps/lmarena-stealth-proxy/.env (PORT=3103) is covered by the root
+# .env rule above — untracked by design. Manual runs need PORT=3103
+# (systemd unit sets it); see README integration section.
 
 # ---- node / python ----
 node_modules/

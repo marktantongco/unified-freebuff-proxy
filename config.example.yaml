@@ -66,6 +66,17 @@ hermes:
   enabled: true
   base_url: "http://127.0.0.1:3101"
 
+# LMArena stealth proxy sidecar (vendored under deps/lmarena-stealth-proxy,
+# served by index.js on :3103; :3102 stays reserved for a second hermes).
+# Gateway relays POST /v1/lmarena/v1/responses + session CRUD; sidecar owns
+# sessions and per-session rate limits. Key-protected like /v1/*.
+lmarena:
+  enabled: true
+  base_url: "http://127.0.0.1:3103"
+  # Manual-eval harness store (blind A/B paste + score, no upstream fetch).
+  # Pasted outputs are user data — keep untracked, like auths/.
+  eval_dir: "evals"
+
 parallel:
   enabled: true
   base_url: "https://api.parallel.ai"

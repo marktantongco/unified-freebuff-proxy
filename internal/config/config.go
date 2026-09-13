@@ -17,6 +17,7 @@ type Config struct {
 	Logging   LoggingConfig   `yaml:"logging"`
 	Dashboard DashboardConfig `yaml:"dashboard"`
 	Hermes    HermesConfig    `yaml:"hermes"`
+	LMArena   LMArenaConfig   `yaml:"lmarena"`
 	Parallel  ParallelConfig  `yaml:"parallel"`
 	Research  ResearchConfig  `yaml:"research"`
 }
@@ -41,6 +42,16 @@ type ParallelConfig struct {
 type HermesConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	BaseURL string `yaml:"base_url"`
+}
+
+// LMArenaConfig points at the lmarena-stealth-proxy sidecar
+// (deps/lmarena-stealth-proxy, :3103), plus the manual-eval harness store.
+type LMArenaConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	BaseURL string `yaml:"base_url"`
+	// EvalDir holds manual-eval JSON files (one per eval). Pasted model
+	// outputs are user data: keep this dir untracked, like auths/.
+	EvalDir string `yaml:"eval_dir"`
 }
 
 // ResearchConfig tunes the native /v1/deep-research harness (Layer B): the
@@ -177,6 +188,12 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Hermes.BaseURL == "" {
 		c.Hermes.BaseURL = "http://127.0.0.1:3101"
+	}
+	if c.LMArena.BaseURL == "" {
+		c.LMArena.BaseURL = "http://127.0.0.1:3103"
+	}
+	if c.LMArena.EvalDir == "" {
+		c.LMArena.EvalDir = "evals"
 	}
 	if c.Parallel.BaseURL == "" {
 		c.Parallel.BaseURL = "https://api.parallel.ai"

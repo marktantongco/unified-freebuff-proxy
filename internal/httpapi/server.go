@@ -6,7 +6,9 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
 
+	"freebuff-unified/internal/eval"
 	"freebuff-unified/internal/hermes"
+	"freebuff-unified/internal/lmarena"
 	"freebuff-unified/internal/parallel"
 	"freebuff-unified/internal/proxy"
 	"freebuff-unified/internal/stealth"
@@ -23,6 +25,14 @@ type Options struct {
 	// Hermes, when set, exposes the stealth sidecar endpoints
 	// (/hermes/healthz, /v1/hermes/fetch, /v1/hermes/session/:id).
 	Hermes *hermes.Client
+	// LMArena, when set, exposes the lmarena-stealth-proxy sidecar relay
+	// (POST /v1/lmarena/v1/responses, /v1/lmarena/v1/session, ...) plus
+	// GET /lmarena/healthz. Key-protected by the auth middleware above.
+	LMArena *lmarena.Client
+	// EvalStore, when set, exposes the manual-eval harness (human pastes
+	// blind A/B outputs, gateway only stores/blinds/scores — no upstream
+	// fetch): POST/GET /v1/lmarena/evals and round/vote/reveal subroutes.
+	EvalStore *eval.Store
 	// Parallel, when enabled, exposes key-gated /v1/parallel/search and
 	// /v1/parallel/extract proxies to the Parallel Web APIs, plus the Layer A
 	// keyless-first /v1/deep-research Task orchestration and /v1/responses.
@@ -73,6 +83,8 @@ func NewApp(opts Options) *fiber.App {
 
 	handlers := newHandlers(opts.Model, opts.Chat, opts.TokenPool, opts.ProxyPool)
 	handlers.hermes = opts.Hermes
+	handlers.lmarena = opts.LMArena
+	handlers.evals = opts.EvalStore
 	handlers.parallel = opts.Parallel
 	handlers.parallelMode = opts.ParallelMode
 	handlers.parallelProcessor = opts.ParallelProcessor
@@ -113,6 +125,23 @@ func NewApp(opts Options) *fiber.App {
 	app.Get("/v1/deep-research/:id", handlers.DeepResearchGet)
 	app.Get("/v1/deep-research/:id/events", handlers.DeepResearchEvents)
 	app.Post("/v1/responses", handlers.ResponsesPassthrough)
+
+	// LMArena stealth proxy sidecar (key-protected, auth middleware above).
+	// Registered before the front-door relay so it stays native in both
+	// modes (like /v1/responses): the sidecar owns sessions + per-session
+	// rate limits; the gateway only strips the /v1/lmarena prefix and
+	// relays bytes.
+	app.Get("/lmarena/healthz", handlers.LMArenaHealth)
+	// Manual-eval harness (native store/score, no upstream fetch). Exact
+	// routes first so the /v1/lmarena/* sidecar relay below never swallows
+	// them, in either gateway mode.
+	app.Post("/v1/lmarena/evals", handlers.EvalCreate)
+	app.Get("/v1/lmarena/evals", handlers.EvalList)
+	app.Get("/v1/lmarena/evals/:id", handlers.EvalGet)
+	app.Post("/v1/lmarena/evals/:id/rounds", handlers.EvalAddRound)
+	app.Post("/v1/lmarena/evals/:id/rounds/:rid/vote", handlers.EvalVote)
+	app.Post("/v1/lmarena/evals/:id/reveal", handlers.EvalReveal)
+	app.All("/v1/lmarena/*", newLMArenaRelay(opts.LMArena, nil))
 
 	if opts.Passthrough != nil {
 		// Front-door mode: /v1/* is relayed verbatim to the freebuff-proxy

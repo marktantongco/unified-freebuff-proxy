@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"freebuff-unified/internal/anthropic"
+	"freebuff-unified/internal/eval"
 	"freebuff-unified/internal/hermes"
+	"freebuff-unified/internal/lmarena"
 	"freebuff-unified/internal/openai"
 	"freebuff-unified/internal/parallel"
 	"freebuff-unified/internal/stealth"
@@ -61,6 +63,8 @@ type handlers struct {
 	tokenPool         PoolStatsProvider
 	proxyPool         PoolStatsProvider
 	hermes            *hermes.Client
+	lmarena           *lmarena.Client
+	evals             *eval.Store
 	parallel          *parallel.Client
 	parallelMode      string
 	parallelProcessor string

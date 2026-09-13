@@ -49,6 +49,7 @@ Fiber app :18080  ── /v1/chat/completions ─┐
 | Upstream client | `internal/freebuff` | codebuff session + chat protocol |
 | Stealth transport | `internal/stealth` | hermes roundtripper, SOCKS5 pool, refresher, metrics |
 | Hermes sidecar | `deps/hermes-service` (+ vendored `deps/hermes`) | Node TLS 1.3 / HTTP2 fingerprint proxy on :3101 |
+| LMArena sidecar | `deps/lmarena-stealth-proxy` (vendored, no secrets) | lmarena.ai session REST API on :3103, relayed as `/v1/lmarena/*` |
 | Credentials | `internal/credentials` | flock-locked JSON store (auths/credentials.json) |
 | Dashboard | `internal/dashboard` | probe engine + SSE UI on :9091 |
 | Parallel / search | `internal/parallel`, `internal/websearch` | Parallel Web APIs; keyless DDG fallback |
@@ -69,8 +70,20 @@ go build -o bin/freebuff-unified ./cmd/freebuff
 
 Endpoints: `GET /healthz`, `GET /v1/models`, `POST /v1/chat/completions`,
 `POST /v1/messages`, `POST /v1/messages/count_tokens`, `GET /ai-stack/status`,
-`GET /stealth/status`, `GET /proxy/verify`, plus the hermes and parallel
-endpoints listed in `internal/httpapi/server.go`.
+`GET /stealth/status`, `GET /proxy/verify`, `GET /lmarena/healthz`,
+`ALL /v1/lmarena/*` (relayed to the sidecar with the prefix stripped),
+plus the hermes and parallel endpoints listed in `internal/httpapi/server.go`.
+
+Manual-eval harness (no lmarena.ai fetch — human pastes blind A/B outputs):
+`POST /v1/lmarena/evals` (create) → `POST /v1/lmarena/evals/:id/rounds`
+(paste prompt + output_a/b, optional model_a/b sealed) →
+`POST /v1/lmarena/evals/:id/rounds/:rid/vote` (`a`/`b`/`tie`) →
+`POST /v1/lmarena/evals/:id/reveal` (unseal labels + per-model score).
+Store: `lmarena.eval_dir` (default `evals/`, untracked).
+
+Start the lmarena sidecar alongside the gateway (systemd unit:
+`deploy/systemd/lmarena-stealth-proxy.service`, or manually with
+`PORT=3103 npm start` in `deps/lmarena-stealth-proxy`).
 
 ## Deployment
 
