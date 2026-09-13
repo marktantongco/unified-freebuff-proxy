@@ -98,3 +98,7 @@ Start the lmarena sidecar alongside the gateway (systemd unit:
 
 Upstream projects: trefeon/freebuff-proxy (MIT), Quorinex/FreeBuff2API (MIT),
 kori-lab/hermes. This repo is a local unification of their ideas, not a fork.
+
+Backend install: the `:3457` freebuff-proxy backend this gateway fronts can
+be installed via `scripts/install.sh` — full guide in
+`docs/backend-installer.md`.
