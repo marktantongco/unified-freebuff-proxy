@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,12 +102,18 @@ func TestRefresherRefreshProbesAndSwaps(t *testing.T) {
 	defer sidecarSrv.Close()
 
 	pool := NewUSProxyPool([]string{"socks5://1.1.1.1:1080"}, nil)
+	var mu sync.Mutex
 	var egressSeen []string
 	ref := NewRefresher(pool, hermes.New(sidecarSrv.URL), nil)
 	ref.MaxProxies = 2
 	ref.geofilter = "" // skip geo lookups in test
 	ref.ProbeTimeout = 3 * time.Second
-	ref.OnEgress = func(ip string) { egressSeen = append(egressSeen, ip) }
+	// Probes run concurrently: guard the observation slice.
+	ref.OnEgress = func(ip string) {
+		mu.Lock()
+		egressSeen = append(egressSeen, ip)
+		mu.Unlock()
+	}
 	ref.fetchFn = func() ([]string, int) {
 		return []string{
 			"socks5://good1.example:1080",
@@ -125,6 +132,8 @@ func TestRefresherRefreshProbesAndSwaps(t *testing.T) {
 	if st["state"] != "ok" || st["alive"] != 2 || st["swapped_in"] != 2 {
 		t.Fatalf("refresher status = %v", st)
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if len(egressSeen) != 2 {
 		t.Errorf("egress observations = %v, want 2", egressSeen)
 	}

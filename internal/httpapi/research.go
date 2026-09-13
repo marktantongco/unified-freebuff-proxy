@@ -361,8 +361,10 @@ func (h *handlers) relayTaskEvents(c fiber.Ctx, runID string) error {
 	c.Set(fiber.HeaderCacheControl, "no-cache")
 	c.Set(fiber.HeaderConnection, "keep-alive")
 
+	// Hoisted: the streamer closure runs after the handler returns and
+	// Fiber recycles c — touching c in there races with ctx release.
+	ctx, cancel := context.WithCancel(c.Context())
 	return c.SendStreamWriter(func(w *bufio.Writer) {
-		ctx, cancel := context.WithCancel(c.Context())
 		defer cancel()
 
 		resp, err := h.parallel.TaskEvents(ctx, runID)
@@ -504,9 +506,10 @@ func (h *handlers) relayResponses(c fiber.Ctx, resp *http.Response) error {
 	}
 	c.Set(fiber.HeaderContentType, firstNonEmpty(resp.Header.Get("Content-Type"), "application/json"))
 
+	// Hoisted: same use-after-release hazard as relayTaskEvents.
+	ctx, cancel := context.WithCancel(c.Context())
 	return c.SendStreamWriter(func(w *bufio.Writer) {
 		defer resp.Body.Close()
-		ctx, cancel := context.WithCancel(c.Context())
 		defer cancel()
 
 		chunks := make(chan []byte, 16)
@@ -613,10 +616,11 @@ func (h *handlers) responsesNativeStream(c fiber.Ctx, req openai.ChatCompletionR
 	c.Set(fiber.HeaderCacheControl, "no-cache")
 	c.Set(fiber.HeaderConnection, "keep-alive")
 
+	// Hoisted (ctx + disconnect channel): the closure below and the chat
+	// stream it feeds outlive the handler; Fiber recycles c on return.
+	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Minute)
+	clientGone := c.Done()
 	return c.SendStreamWriter(func(w *bufio.Writer) {
-		// ctx is created inside the callback so streaming is not canceled when
-		// the handler returns (SendStreamWriter returns promptly).
-		ctx, cancel := context.WithTimeout(c, 5*time.Minute)
 		defer cancel()
 
 		deltas, errs := h.chat.Stream(ctx, req)
@@ -652,7 +656,7 @@ func (h *handlers) responsesNativeStream(c fiber.Ctx, req openai.ChatCompletionR
 				if !writeStreamComment(w) {
 					return
 				}
-			case <-c.Done():
+			case <-clientGone:
 				return
 			}
 		}
@@ -722,13 +726,14 @@ func (h *handlers) bufferedResearch(c fiber.Ctx, opts researchOpts) error {
 		err error
 	}
 	done := make(chan result, 1)
+	// Hoisted: the background run and the heartbeat streamer below outlive
+	// the handler, and Fiber recycles c on return. The parent ctx and the
+	// disconnect channel are dereferenced here, while c is still owned.
+	runCtx, runCancel := context.WithTimeout(c.Context(), h.research.timeout())
+	clientGone := c.Done()
 	go func() {
-		// ctx lives inside the goroutine so it is not canceled when the handler
-		// returns (defer cancel at handler scope would kill runs >15s that have
-		// switched to the heartbeat/streaming writer).
-		ctx, cancel := context.WithTimeout(c, h.research.timeout())
-		defer cancel()
-		rep, err := h.runResearch(ctx, opts)
+		defer runCancel()
+		rep, err := h.runResearch(runCtx, opts)
 		done <- result{rep, err}
 	}()
 
@@ -767,7 +772,7 @@ func (h *handlers) bufferedResearch(c fiber.Ctx, opts researchOpts) error {
 					if err := w.Flush(); err != nil {
 						return
 					}
-				case <-c.Done():
+				case <-clientGone:
 					return
 				}
 			}
@@ -784,8 +789,10 @@ func (h *handlers) streamResearch(c fiber.Ctx, opts researchOpts) error {
 	c.Set(fiber.HeaderCacheControl, "no-cache")
 	c.Set(fiber.HeaderConnection, "keep-alive")
 
+	// Hoisted: the frame pump below outlives the handler; Fiber recycles
+	// c on return.
+	ctx, cancel := context.WithTimeout(c.Context(), h.research.timeout())
 	return c.SendStreamWriter(func(w *bufio.Writer) {
-		ctx, cancel := context.WithTimeout(c, h.research.timeout())
 		defer cancel()
 		frames := make(chan []byte, 64)
 

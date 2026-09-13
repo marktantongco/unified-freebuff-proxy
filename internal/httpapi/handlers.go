@@ -424,8 +424,14 @@ func (h *handlers) ChatCompletions(c fiber.Ctx) error {
 		err  error
 	}
 	done := make(chan result, 1)
+	// Hoisted: the background completion and the heartbeat streamer below
+	// outlive the handler, and Fiber recycles c on return. chatCtx keeps
+	// disconnect propagation (parented on the request ctx); clientGone
+	// replaces post-return c.Done() reads.
+	chatCtx, chatCancel := context.WithCancel(c.Context())
+	clientGone := c.Done()
 	go func() {
-		t, e := h.chat.Complete(c, req)
+		t, e := h.chat.Complete(chatCtx, req)
 		done <- result{t, e}
 	}()
 
@@ -440,6 +446,7 @@ func (h *handlers) ChatCompletions(c fiber.Ctx) error {
 	// if available — fallback is to simply wait (WriteTimeout 310s handles it).
 	select {
 	case r := <-done:
+		chatCancel()
 		if r.err != nil {
 			return writeServiceError(c, r.err)
 		}
@@ -450,6 +457,7 @@ func (h *handlers) ChatCompletions(c fiber.Ctx) error {
 		// Rare path: only when generation >15s.
 		c.Set("Content-Type", "application/json")
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			defer chatCancel()
 			ticker := time.NewTicker(streamHeartbeatInterval)
 			defer ticker.Stop()
 			// Send initial whitespace chunk so headers + first byte are flushed.
@@ -478,12 +486,13 @@ func (h *handlers) ChatCompletions(c fiber.Ctx) error {
 					if err := w.Flush(); err != nil {
 						return
 					}
-				case <-c.Done():
+				case <-clientGone:
 					return
 				}
 			}
 		})
 	case <-c.Done():
+		chatCancel()
 		return writeServiceError(c, &ServiceError{Status: http.StatusRequestTimeout, Code: "request_cancelled", Message: "client disconnected"})
 	}
 }
