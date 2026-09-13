@@ -35,9 +35,10 @@ const (
 )
 
 // transport-level retry tuning for doJSONRequest (transport errors only).
+// maxTransportAttempts is the TOTAL number of sends (initial + 1 retry).
 const (
-	maxTransportRetries = 2
-	transportRetryDelay = 200 * time.Millisecond
+	maxTransportAttempts = 2
+	transportRetryDelay  = 200 * time.Millisecond
 )
 
 var freebuffAgentIDsByModel = map[string]string{
@@ -509,7 +510,7 @@ func (c *Client) doJSONRequest(ctx context.Context, token string, path string, p
 	// handshake storm leftovers) are retried once with a short backoff instead
 	// of surfacing as user-visible timeouts. Never retried: HTTP status errors
 	// (only transport errors reach this path), caller cancellation/deadlines.
-	for attempt := 0; attempt < maxTransportRetries; attempt++ {
+	for attempt := 0; attempt < maxTransportAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-time.After(transportRetryDelay):
