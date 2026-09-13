@@ -52,6 +52,11 @@ type LMArenaConfig struct {
 	// EvalDir holds manual-eval JSON files (one per eval). Pasted model
 	// outputs are user data: keep this dir untracked, like auths/.
 	EvalDir string `yaml:"eval_dir"`
+	// Leaderboard enables the cached public text-leaderboard snapshot
+	// (GET /v1/lmarena/leaderboard). Read-only HF datasets-server data.
+	Leaderboard bool `yaml:"leaderboard"`
+	// LeaderboardRefreshH bounds snapshot refresh to once per N hours.
+	LeaderboardRefreshH int `yaml:"leaderboard_refresh_hours"`
 }
 
 // ResearchConfig tunes the native /v1/deep-research harness (Layer B): the
@@ -194,6 +199,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.LMArena.EvalDir == "" {
 		c.LMArena.EvalDir = "evals"
+	}
+	if c.LMArena.LeaderboardRefreshH <= 0 {
+		c.LMArena.LeaderboardRefreshH = 24
 	}
 	if c.Parallel.BaseURL == "" {
 		c.Parallel.BaseURL = "https://api.parallel.ai"

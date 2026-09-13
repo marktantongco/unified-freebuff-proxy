@@ -1,12 +1,15 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"freebuff-unified/internal/eval"
+	"freebuff-unified/internal/lmarena"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -112,6 +115,33 @@ func TestEvalFullFlow(t *testing.T) {
 	}
 }
 
+func TestEvalImportFlow(t *testing.T) {
+	app := newEvalTestApp(t)
+	_, body := doRequest(t, app, evalReq(t, http.MethodPost, "/v1/lmarena/evals", `{"name":"bulk"}`))
+	id := decodeBody(t, body)["eval"].(map[string]any)["id"].(string)
+
+	payload := `{"format":"jsonl","data":"{\"prompt\":\"p\",\"output_a\":\"a\",\"output_b\":\"b\",\"winner\":\"tie\"}\n{\"prompt\":\"q\",\"output_a\":\"a\",\"output_b\":\"b\"}\n"}`
+	code, body := doRequest(t, app, evalReq(t, http.MethodPost, "/v1/lmarena/evals/"+id+"/import", payload))
+	if code != http.StatusCreated {
+		t.Fatalf("import: %d %s", code, body)
+	}
+	if got := decodeBody(t, body)["imported"].(float64); got != 2 {
+		t.Fatalf("imported = %v, want 2", got)
+	}
+	_, body = doRequest(t, app, evalReq(t, http.MethodGet, "/v1/lmarena/evals/"+id, ""))
+	if got := decodeBody(t, body)["score"].(map[string]any)["ties"].(float64); got != 1 {
+		t.Fatalf("ties = %v, want 1: %s", got, body)
+	}
+
+	// Bad format + bad data rejected.
+	if code, _ := doRequest(t, app, evalReq(t, http.MethodPost, "/v1/lmarena/evals/"+id+"/import", `{"format":"xml","data":"x"}`)); code != http.StatusBadRequest {
+		t.Fatalf("bad format: want 400, got %d", code)
+	}
+	if code, _ := doRequest(t, app, evalReq(t, http.MethodPost, "/v1/lmarena/evals/"+id+"/import", `{"format":"csv","data":"prompt,output_a\np,a\n"}`)); code != http.StatusBadRequest {
+		t.Fatalf("bad csv: want 400, got %d", code)
+	}
+}
+
 func TestEvalDisabled(t *testing.T) {
 	app := NewApp(Options{Model: "m", ProxyAPIKey: "k", Chat: okChatService{}})
 	req := httptest.NewRequest(http.MethodPost, "/v1/lmarena/evals", strings.NewReader(`{"name":"x"}`))
@@ -130,5 +160,54 @@ func TestEvalUnauthorized(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/lmarena/evals", nil)
 	if code, _ := doRequest(t, app, req); code != http.StatusUnauthorized {
 		t.Fatalf("no key: want 401, got %d", code)
+	}
+}
+
+func TestLeaderboardEndpoint(t *testing.T) {
+	rows := []map[string]any{
+		{"model_name": "alpha", "rating": 1500.0, "rank": 1.0, "category": "overall"},
+		{"model_name": "beta", "rating": 1400.0, "rank": 2.0, "category": "overall"},
+		{"model_name": "gamma", "rating": 1300.0, "rank": 3.0, "category": "overall"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		type row struct {
+			Row map[string]any `json:"row"`
+		}
+		out := map[string]any{"rows": []row{}}
+		for _, m := range rows {
+			out["rows"] = append(out["rows"].([]row), row{Row: m})
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	}))
+	defer srv.Close()
+
+	board := lmarena.NewLeaderboard(t.TempDir(), srv.URL, time.Hour)
+	app := NewApp(Options{Model: "m", ProxyAPIKey: "k", Chat: okChatService{}, Leaderboard: board})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/lmarena/leaderboard?top=2", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	code, body := doRequest(t, app, req)
+	if code != http.StatusOK {
+		t.Fatalf("leaderboard: %d %s", code, body)
+	}
+	var snap map[string]any
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if entries := snap["entries"].([]any); len(entries) != 2 || entries[0].(map[string]any)["model"] != "alpha" {
+		t.Fatalf("bad entries: %s", body)
+	}
+
+	// bad top + disabled board.
+	req = httptest.NewRequest(http.MethodGet, "/v1/lmarena/leaderboard?top=0", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	if code, _ := doRequest(t, app, req); code != http.StatusBadRequest {
+		t.Fatalf("bad top: want 400, got %d", code)
+	}
+	app2 := NewApp(Options{Model: "m", ProxyAPIKey: "k", Chat: okChatService{}})
+	req = httptest.NewRequest(http.MethodGet, "/v1/lmarena/leaderboard", nil)
+	req.Header.Set("Authorization", "Bearer k")
+	if code, _ := doRequest(t, app2, req); code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled: want 503, got %d", code)
 	}
 }

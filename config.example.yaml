@@ -76,6 +76,10 @@ lmarena:
   # Manual-eval harness store (blind A/B paste + score, no upstream fetch).
   # Pasted outputs are user data — keep untracked, like auths/.
   eval_dir: "evals"
+  # Public text-leaderboard snapshot (read-only HF datasets-server data,
+  # cached under eval_dir, refreshed at most once per refresh window).
+  leaderboard: true
+  leaderboard_refresh_hours: 24
 
 parallel:
   enabled: true

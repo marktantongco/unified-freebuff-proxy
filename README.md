@@ -76,10 +76,19 @@ plus the hermes and parallel endpoints listed in `internal/httpapi/server.go`.
 
 Manual-eval harness (no lmarena.ai fetch — human pastes blind A/B outputs):
 `POST /v1/lmarena/evals` (create) → `POST /v1/lmarena/evals/:id/rounds`
-(paste prompt + output_a/b, optional model_a/b sealed) →
+(paste prompt + output_a/b, optional model_a/b sealed) or bulk
+`POST /v1/lmarena/evals/:id/import` (`{"format":"jsonl"|"csv","data":"..."}`,
+500 records max, winners optional = pre-voted) →
 `POST /v1/lmarena/evals/:id/rounds/:rid/vote` (`a`/`b`/`tie`) →
-`POST /v1/lmarena/evals/:id/reveal` (unseal labels + per-model score).
+`POST /v1/lmarena/evals/:id/reveal` (unseal labels + score with win counts
+and Bradley-Terry Elo ratings, arena-rank methodology with a weak tie-prior
+for sparse data).
 Store: `lmarena.eval_dir` (default `evals/`, untracked).
+
+Public leaderboard: `GET /v1/lmarena/leaderboard?category=overall&top=5`
+(read-only HF `lmarena-ai/leaderboard-dataset`, CC-BY-4.0, cached under
+eval_dir, `lmarena.leaderboard_refresh_hours` default 24; stale cache covers
+HF downtime).
 
 Start the lmarena sidecar alongside the gateway (systemd unit:
 `deploy/systemd/lmarena-stealth-proxy.service`, or manually with

@@ -302,6 +302,15 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		}
 	}
 
+	// ── Public leaderboard snapshot (read-only HF data, disk cache) ──────
+	// Lazy: first request fetches (~100 pages), then serves cache for the
+	// refresh window. Stale cache covers HF downtime.
+	var board *lmarena.Leaderboard
+	if cfg.LMArena.Leaderboard {
+		board = lmarena.NewLeaderboard(cfg.LMArena.EvalDir, "", time.Duration(cfg.LMArena.LeaderboardRefreshH)*time.Hour)
+		logger.Printf("leaderboard snapshot on: refresh=%dh", cfg.LMArena.LeaderboardRefreshH)
+	}
+
 	// Keyless stealth web search (DuckDuckGo via hermes sidecar) — backs
 	// /v1/parallel/search when no Parallel API key is configured.
 	var webSearcher *websearch.Searcher
@@ -375,7 +384,7 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		ProxyAPIKey: apiKey,
 		Chat:        chatService,
 		TokenPool:   tokenPool,
-		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, LMArena: lmarenaClient, EvalStore: evalStore, Parallel: parallelClient,
+		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, LMArena: lmarenaClient, EvalStore: evalStore, Leaderboard: board, Parallel: parallelClient,
 		Passthrough:       passthrough,
 		BackendURL:        passthroughBackendURL(cfg),
 		ParallelMode:      cfg.Parallel.DefaultMode,
@@ -394,7 +403,7 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		},
 		ExtraHealth: func() map[string]any { return extraHealth(cfg, usProxyPool) },
 		AIStack: httpapi.ServeStaleCache(func() map[string]any {
-			return aiStackStatus(cfg, hermesClient, lmarenaClient, usProxyPool, parallelClient, webSearcher)
+			return aiStackStatus(cfg, hermesClient, lmarenaClient, board, usProxyPool, parallelClient, webSearcher)
 		}),
 	})
 
@@ -486,7 +495,7 @@ func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[strin
 	return body
 }
 
-func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, lmarenaClient *lmarena.Client, usProxyPool *stealth.USProxyPool, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
+func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, lmarenaClient *lmarena.Client, board *lmarena.Leaderboard, usProxyPool *stealth.USProxyPool, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
 	proxyBackend := passthroughBackendURL(cfg)
 	return map[string]any{
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
@@ -512,7 +521,7 @@ func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, lmarenaClien
 				"endpoints": []string{"/healthz", "/v1/models", "/v1/chat/completions", "/proxy/verify"},
 			},
 			"hermes_stealth_sidecar": hermesStatus(cfg, hermesClient),
-			"lmarena_stealth_proxy":  lmarenaStatus(cfg, lmarenaClient),
+			"lmarena_stealth_proxy":  lmarenaStatus(cfg, lmarenaClient, board),
 			"parallel_web_apis":      parallelStatus(parallelClient, webSearcher),
 		},
 		"providers": map[string]any{
@@ -557,8 +566,9 @@ func hermesStatus(cfg *config.Config, client *hermes.Client) map[string]any {
 }
 
 // lmarenaStatus reports the lmarena-stealth-proxy sidecar state for
-// /ai-stack/status.
-func lmarenaStatus(cfg *config.Config, client *lmarena.Client) map[string]any {
+// /ai-stack/status, plus the cached public leaderboard top-5 (cache read
+// only — status must never trigger a 100-page network fetch).
+func lmarenaStatus(cfg *config.Config, client *lmarena.Client, board *lmarena.Leaderboard) map[string]any {
 	if !cfg.LMArena.Enabled || client == nil {
 		return map[string]any{
 			"address": cfg.LMArena.BaseURL,
@@ -575,12 +585,26 @@ func lmarenaStatus(cfg *config.Config, client *lmarena.Client) map[string]any {
 			"error":   err.Error(),
 		}
 	}
-	return map[string]any{
+	out := map[string]any{
 		"address":   cfg.LMArena.BaseURL,
 		"status":    h.Status,
 		"uptime_s":  h.Uptime,
-		"endpoints": []string{"/v1/lmarena/v1/responses", "/v1/lmarena/v1/session", "/v1/lmarena/evals", "/lmarena/healthz"},
+		"endpoints": []string{"/v1/lmarena/v1/responses", "/v1/lmarena/v1/session", "/v1/lmarena/evals", "/v1/lmarena/leaderboard", "/lmarena/healthz"},
 	}
+	if board != nil {
+		if snap, ok := board.Cached("overall"); ok {
+			top := make([]string, 0, 5)
+			for i, e := range snap.Entries {
+				if i >= 5 {
+					break
+				}
+				top = append(top, e.Model)
+			}
+			out["leaderboard_updated"] = snap.Updated
+			out["leaderboard_top5"] = top
+		}
+	}
+	return out
 }
 
 // keySet renders a masked key indicator for the check command.
