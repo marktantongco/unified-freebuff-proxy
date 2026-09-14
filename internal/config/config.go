@@ -105,14 +105,25 @@ type BreakerConfig struct {
 }
 
 type StealthConfig struct {
-	USProxies        []string `yaml:"us_proxies"`
-	StripHeaders     bool     `yaml:"strip_headers"`
-	Enabled          bool     `yaml:"enabled"`
-	Profile          string   `yaml:"profile"`
-	ProxyURL         string   `yaml:"proxy_url"`
-	ProxyRefreshMins int      `yaml:"proxy_refresh_mins"`
-	StrictGeo        bool     `yaml:"strict_geo"`
-	GeoVerify        bool     `yaml:"geo_verify"`
+	USProxies    []string `yaml:"us_proxies"`
+	StripHeaders bool     `yaml:"strip_headers"`
+	Enabled      bool     `yaml:"enabled"`
+	// Profile selects the native TLS fingerprint (resolved via
+	// stealth.ProfileByName): a ProfileID ("chrome120", "chrome131",
+	// "chrome133", "edge106", "firefox102", "firefox105", "firefox120",
+	// "safari16", "safari17", "ios", "android"), "random", "rotate", or
+	// "" for the pinned default (chrome120). Note: production egress
+	// currently goes through the hermes sidecar (own fingerprints);
+	// this selects the native dialer + header sanitizer profile.
+	Profile string `yaml:"profile"`
+	// Validator selects the SOCKS5 pool validation engine: "internal"
+	// (default; sidecar-probed refresher) or "prox5" (prox5 validation
+	// engine with mid-dial retry, see internal/stealth/prox5pool.go).
+	Validator        string `yaml:"validator"`
+	ProxyURL         string `yaml:"proxy_url"`
+	ProxyRefreshMins int    `yaml:"proxy_refresh_mins"`
+	StrictGeo        bool   `yaml:"strict_geo"`
+	GeoVerify        bool   `yaml:"geo_verify"`
 	// AutoRefreshPool enables the background refresher that fetches,
 	// probes, and hot-swaps the SOCKS5 pool (default false).
 	AutoRefreshPool bool `yaml:"auto_refresh_pool"`
@@ -190,6 +201,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Stealth.ProxyRefreshMins <= 0 {
 		c.Stealth.ProxyRefreshMins = 30
+	}
+	if c.Stealth.Validator == "" {
+		c.Stealth.Validator = "internal"
 	}
 	if c.Hermes.BaseURL == "" {
 		c.Hermes.BaseURL = "http://127.0.0.1:3101"
