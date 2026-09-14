@@ -700,12 +700,13 @@ func chatStatusError(resp *http.Response, stage string) *APIError {
 }
 
 var safeUpstreamErrorMessages = map[string]string{
-	"freebuff_update_required": "Freebuff session information is missing or outdated",
-	"session_expired":          "Freebuff session has expired",
-	"session_model_mismatch":   "Freebuff session model does not match request model",
-	"session_superseded":       "Freebuff session was superseded by another session",
-	"waiting_room_queued":      "Freebuff session is still in queue",
-	"waiting_room_required":    "Freebuff waiting room session is required",
+	"freebuff_update_required":       "Freebuff session information is missing or outdated",
+	"session_expired":                "Freebuff session has expired",
+	"session_model_mismatch":         "Freebuff session model does not match request model",
+	"session_superseded":             "Freebuff session was superseded by another session",
+	"waiting_room_queued":            "Freebuff session is still in queue",
+	"waiting_room_required":          "Freebuff waiting room session is required",
+	"free_mode_invalid_agent_model": "Free mode is only available for specific agent and model combinations",
 }
 
 func safeUpstreamErrorCode(body io.Reader) (string, bool) {
@@ -791,6 +792,8 @@ func chatStreamEventError(code string) *APIError {
 	switch code {
 	case "freebuff_auth_failed":
 		return &APIError{StatusCode: http.StatusUnauthorized, Code: "freebuff_auth_failed", Message: "Freebuff chat authorization failed"}
+	case "free_mode_invalid_agent_model":
+		return &APIError{StatusCode: http.StatusForbidden, Code: "free_mode_invalid_agent_model", Message: "Free mode is only available for specific agent and model combinations"}
 	case "freebuff_rate_limited":
 		return &APIError{StatusCode: http.StatusTooManyRequests, Code: "freebuff_rate_limited", Message: "Freebuff chat rate limit exceeded"}
 	case "upstream_chat_unavailable":
