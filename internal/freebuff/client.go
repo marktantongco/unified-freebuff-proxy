@@ -52,9 +52,13 @@ const (
 	transportRetryDelay  = 200 * time.Millisecond
 )
 
+// Static offline-fallback snapshot of upstream's free-mode (agent, model)
+// pairings. The live agent registry (registry.go) is the primary source —
+// this map only serves when no registry refresh has ever succeeded. Retired
+// models (minimax-m2.7, kimi-k2.6) were dropped upstream 2026-09; glm's
+// pairing was added upstream the same month.
 var freebuffAgentIDsByModel = map[string]string{
-	"minimax/minimax-m2.7":       "base2-free",
-	"moonshotai/kimi-k2.6":       "base2-free-kimi",
+	"z-ai/glm-5.3-flash":         "base2-free-glm-5-3-flash",
 	"deepseek/deepseek-v4-pro":   "base2-free-deepseek",
 	"deepseek/deepseek-v4-flash": "base2-free-deepseek-flash",
 	"freebuff-chat-verified":     "base2-free",
@@ -504,6 +508,11 @@ func (c *Client) buildUpstreamChatRequest(model string, messages []ChatMessage, 
 
 
 func agentIDForModel(model string) string {
+	// Live registry first (refreshed from upstream's TS constants every 6h);
+	// static snapshot as offline fallback; defaultFreeAgentID last.
+	if agentID, ok := liveAgentRegistry.get(CanonicalModelName(model)); ok {
+		return agentID
+	}
 	if agentID, ok := freebuffAgentIDsByModel[CanonicalModelName(model)]; ok {
 		return agentID
 	}

@@ -172,6 +172,10 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		logger.Printf("upstream client: %v (chat endpoints will return 503)", upstreamErr)
 	} else {
 		sessMgr = session.NewManager(credsStore, upstreamClient, "freebuff-unified")
+
+		// Live agent registry: model→agent pairings refreshed from upstream's
+		// TS constants every 6h; static snapshot stays as offline fallback.
+		freebuff.StartAgentRegistry(context.Background())
 		// Pre-warm default model session 5s after boot so first query skips queue.
 		if cfg.Upstream.DefaultModel != "" {
 			sessMgr.Prewarm(context.Background(), cfg.Upstream.DefaultModel)
