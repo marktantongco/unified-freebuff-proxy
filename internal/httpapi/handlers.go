@@ -66,6 +66,7 @@ type handlers struct {
 	lmarena           *lmarena.Client
 	evals             *eval.Store
 	board             *lmarena.Leaderboard
+	evalsDirFn        func() string // injected: returns lmarena.eval_dir
 	parallel          *parallel.Client
 	parallelMode      string
 	parallelProcessor string
@@ -92,6 +93,13 @@ func newHandlers(model string, chat ChatService, tokenPool, proxyPool PoolStatsP
 		tokenPool: tokenPool,
 		proxyPool: proxyPool,
 	}
+}
+
+func (h *handlers) evalsDir() string {
+	if h.evalsDirFn != nil {
+		return h.evalsDirFn()
+	}
+	return ""
 }
 
 // HermesHealth reports the hermes stealth sidecar liveness.

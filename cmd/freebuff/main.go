@@ -385,6 +385,7 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		Chat:        chatService,
 		TokenPool:   tokenPool,
 		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, LMArena: lmarenaClient, EvalStore: evalStore, Leaderboard: board, Parallel: parallelClient,
+		EvalsDirFn:        func() string { return cfg.LMArena.EvalDir },
 		Passthrough:       passthrough,
 		BackendURL:        passthroughBackendURL(cfg),
 		ParallelMode:      cfg.Parallel.DefaultMode,

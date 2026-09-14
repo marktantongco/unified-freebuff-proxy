@@ -36,6 +36,9 @@ type Options struct {
 	// Leaderboard, when set, serves the cached public text-leaderboard
 	// snapshot (GET /v1/lmarena/leaderboard). Read-only HF data.
 	Leaderboard *lmarena.Leaderboard
+	// EvalsDirFn returns the lmarena.eval_dir (used by /readyz to probe
+	// writability of the manual eval harness store).
+	EvalsDirFn func() string
 	// Parallel, when enabled, exposes key-gated /v1/parallel/search and
 	// /v1/parallel/extract proxies to the Parallel Web APIs, plus the Layer A
 	// keyless-first /v1/deep-research Task orchestration and /v1/responses.
@@ -89,6 +92,7 @@ func NewApp(opts Options) *fiber.App {
 	handlers.lmarena = opts.LMArena
 	handlers.evals = opts.EvalStore
 	handlers.board = opts.Leaderboard
+	handlers.evalsDirFn = opts.EvalsDirFn
 	handlers.parallel = opts.Parallel
 	handlers.parallelMode = opts.ParallelMode
 	handlers.parallelProcessor = opts.ParallelProcessor
@@ -105,7 +109,8 @@ func NewApp(opts Options) *fiber.App {
 		app.Use(func(c fiber.Ctx) error {
 			// Health, ai-stack status, and proxy verification endpoints are
 			// always public so monitors can probe them without a key.
-			if c.Path() == "/healthz" || c.Path() == "/ai-stack/status" || c.Path() == "/proxy/verify" {
+			if c.Path() == "/healthz" || c.Path() == "/health/all" || c.Path() == "/readyz" ||
+				c.Path() == "/ai-stack/status" || c.Path() == "/proxy/verify" {
 				return c.Next()
 			}
 			return authMiddleware(opts.ProxyAPIKey)(c)
@@ -147,6 +152,11 @@ func NewApp(opts Options) *fiber.App {
 	app.Post("/v1/lmarena/evals/:id/rounds/:rid/vote", handlers.EvalVote)
 	app.Post("/v1/lmarena/evals/:id/reveal", handlers.EvalReveal)
 	app.Get("/v1/lmarena/leaderboard", handlers.Leaderboard)
+
+	// Aggregated sidecar probe + deep readiness (medium-effort ops surface)
+	app.Get("/health/all", handlers.HealthAll)
+	app.Get("/readyz", handlers.Readyz)
+
 	app.All("/v1/lmarena/*", newLMArenaRelay(opts.LMArena, nil))
 
 	// Sidecar-native surfaces: hermes stealth, parallel search/extract.

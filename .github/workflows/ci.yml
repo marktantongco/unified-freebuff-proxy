@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main, integrate/main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: build + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Verify modules
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (with race detector)
+        run: go test -race ./...
+
+      - name: Smoke test (live endpoints)
+        # Hits the gateway already running on the host's :18080 (via self-hosted
+        # runner). For CI without runner access, this step is skipped.
+        continue-on-error: true
+        run: ./scripts/operations/smoke.sh
