@@ -78,6 +78,9 @@ flowchart TB
 | **session** | A remembered conversation key | `sessionId` UUID |
 | **rate limit** | Max turns per minute, so nobody hogs the swing | `client_rpm: 60` |
 | **sealed** | Hidden until the big reveal, like a vote count | Model names in evals |
+| **profile** | A browser disguise (TLS + headers) | `chrome131`, `safari17`, `ios` |
+| **validator** | The engine that checks proxies work | `internal` or `prox5` |
+| **dispenser** | The counter handing out proxies | `Next()` never blocks, miss → direct |
 | **Bradley-Terry** | A fairness math that turns wins into ratings | `bt_ratings` in scores |
 | **cache** | Yesterday's answers kept in a drawer for speed | Leaderboard snapshot |
 | **stale-while-revalidate** | Serve the drawer copy while fetching a fresh one | HF downtime safety |
@@ -95,6 +98,7 @@ flowchart TB
 | Hermes sidecar | `1.0.0` | `deps/hermes-service/package.json` |
 | LMArena sidecar | `1.0.0` | `deps/lmarena-stealth-proxy/package.json` |
 | Gateway config shape | `unified-v1` | `/healthz` payload |
+| prox5 pool engine | `v1.3.0` | `go.mod` (opt-in via `stealth.validator: prox5`) |
 | Leaderboard data | `2026-09-11` snapshot | `/v1/lmarena/leaderboard` (`updated` field) |
 
 ---
@@ -212,7 +216,7 @@ sequenceDiagram
 | `server` | Which port + which keys open the door | `listen: ":18080"`, `api_keys` |
 | `upstream` | Which free-model cloud + default brain | `base_url`, `default_model` |
 | `auth` | Login breaker (locks out after failures) | `threshold: 3`, `cooldown: 12h` |
-| `stealth` | Disguise + proxy pool refresh | `enabled`, `us_proxies`, `proxy_refresh_mins` |
+| `stealth` | Disguise + pool refresh + validation engine | `enabled`, `profile`, `validator`, `us_proxies` |
 | `limits` | Three speed limits | `global_rpm`, `account_rpm`, `client_rpm` |
 | `proxy` | Report vs passthrough + backend address | `mode`, `backend_url` |
 | `dashboard` | Control-room address | `addr: ":9091"` |
@@ -255,7 +259,6 @@ sequenceDiagram
 ---
 
 ## 8. Eval harness walkthrough — run a fair contest
-
 ```mermaid
 flowchart LR
     A["📝 1. Battle in browser<br/>(by hand)"] --> B["📥 2. Create eval +<br/>paste A/B outputs"]
@@ -298,7 +301,48 @@ second.
 
 ---
 
-## 9. Troubleshooting — symptom → fix
+## 9. Stealth profiles & pool engines
+
+Two knobs, plain rules. Production egress currently flows through the
+hermes sidecar (own fingerprints); these select the **native** dialer +
+header layer and the SOCKS5 validation engine.
+
+**Profiles** (`stealth.profile`, default `chrome120` = pinned). Names resolve
+via `ProfileByName`; unknown names fall back to default — never an error:
+
+| Name | Disguise |
+|------|----------|
+| `chrome120` *(default)* | Chrome 120, Windows |
+| `chrome131`, `chrome133` | Chrome 131/133, Windows/macOS |
+| `edge106` | Edge 106, Windows |
+| `firefox102`, `firefox105`, `firefox120` | Firefox ESR → current, Linux/Windows |
+| `safari16`, `safari17` | Safari, macOS |
+| `ios` | Mobile Safari, iPhone |
+| `android` | Mobile Chrome, Pixel |
+| `random` | Uniform pick per connection |
+| `rotate` | Deterministic round-robin (desktop first, mobile last) |
+
+**Pool engines** (`stealth.validator`, default `internal`):
+
+| Engine | How it checks | Extra |
+|--------|---------------|-------|
+| `internal` | Sidecar-probed refresher, hot-swap | Refresher + metrics unchanged |
+| `prox5` | Validation engine + **mid-dial retry** (dead proxy → next, client held) | Same `Next/Size/Replace` seam; build failure falls back to internal |
+
+```mermaid
+flowchart LR
+    REQ["request"] --> DISP["dispenser.Next()"]
+    DISP -->|validated URL| PROXY["SOCKS5 dial"]
+    DISP -->|nil miss| DIRECT["direct dial"]
+    PROXY -->|fail| NEXT["next proxy (prox5)\nor direct (internal)"]
+```
+
+> [!NOTE]
+> `Next()` never blocks: empty pool is a miss, not a wait. Live pool stays
+> disabled in default config (direct egress measured faster); enable with
+> `us_proxies` + `auto_refresh_pool`.
+
+## 10. Troubleshooting — symptom → fix
 
 | 🔴 Symptom | 🟡 Likely cause | 🟢 Fix |
 |------------|-----------------|--------|
@@ -311,7 +355,7 @@ second.
 
 ---
 
-## 10. History, family & rules
+## 11. History, family & rules
 
 - `SESSION_SUMMARY.md` — 2026-09-03 three-lineage merge log
 - `planning/2026-09-09-freebuff-slow-investigation.md` — 5-minute-abort root cause

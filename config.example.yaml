@@ -32,6 +32,11 @@ stealth:
   proxy_refresh_mins: 30
   max_pool_proxies: 12
   profile: "chrome120"
+  # ...or "random" / "rotate" / named ID (chrome131, chrome133, edge106,
+  # firefox102, firefox105, firefox120, safari16, safari17, ios, android).
+  # Pool validation engine: "internal" (default) or "prox5" (validation
+  # engine + mid-dial retry; refresher + metrics unchanged).
+  validator: "internal"
   # US SOCKS5 egress pool (round-robin). Generate candidates with
   # scripts/fetch-proxies.sh and validate with scripts/test-proxies.sh.
   us_proxies:

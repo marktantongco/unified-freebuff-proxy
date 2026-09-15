@@ -98,8 +98,8 @@ func runCheck(cfg *config.Config, configPath string) {
 		len(cfg.Auth.APIKeys), cfg.Auth.Breaker.Threshold, cfg.Auth.Breaker.Cooldown)
 	fmt.Printf("upstream:  %s (default=%s)\n", cfg.Upstream.BaseURL, cfg.Upstream.DefaultModel)
 	fmt.Printf("proxy:     enabled=%v backend=%s\n", cfg.Proxy.Enabled, cfg.Proxy.BackendURL)
-	fmt.Printf("stealth:   enabled=%v profile=%s us_proxies=%d strip_headers=%v\n",
-		cfg.Stealth.Enabled, cfg.Stealth.Profile, len(cfg.Stealth.USProxies), cfg.Stealth.StripHeaders)
+	fmt.Printf("stealth:   enabled=%v profile=%s validator=%s us_proxies=%d strip_headers=%v\n",
+		cfg.Stealth.Enabled, cfg.Stealth.Profile, cfg.Stealth.Validator, len(cfg.Stealth.USProxies), cfg.Stealth.StripHeaders)
 	fmt.Printf("limits:    global_rpm=%d\n", cfg.Limits.GlobalRPM)
 	fmt.Printf("dashboard: enabled=%v addr=%s\n", cfg.Dashboard.Enabled, cfg.Dashboard.Addr)
 	fmt.Printf("parallel:   enabled=%v mode=%s processor=%s key=%s\n",
@@ -172,6 +172,10 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 		logger.Printf("upstream client: %v (chat endpoints will return 503)", upstreamErr)
 	} else {
 		sessMgr = session.NewManager(credsStore, upstreamClient, "freebuff-unified")
+
+		// Live agent registry: model→agent pairings refreshed from upstream's
+		// TS constants every 6h; static snapshot stays as offline fallback.
+		freebuff.StartAgentRegistry(context.Background())
 		// Pre-warm default model session 5s after boot so first query skips queue.
 		if cfg.Upstream.DefaultModel != "" {
 			sessMgr.Prewarm(context.Background(), cfg.Upstream.DefaultModel)
@@ -188,9 +192,22 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 	logger.Printf("rate limits: global=%d rpm, account=%d rpm, client=%d rpm", cfg.Limits.GlobalRPM, cfg.Limits.AccountRPM, cfg.Limits.ClientRPM)
 
 	// ── US SOCKS5 proxy pool (freebuff-unified) ────────────────────────────
-	var usProxyPool *stealth.USProxyPool
+	// Validator selects the engine: "prox5" (validation engine + mid-dial
+	// retry) or anything else (internal sidecar-probed pool). prox5 build
+	// failure falls back to internal — never a nil live pool.
+	var usProxyPool stealth.ProxyDispenser
 	if len(cfg.Stealth.USProxies) > 0 {
-		usProxyPool = stealth.NewUSProxyPool(cfg.Stealth.USProxies, logger)
+		if cfg.Stealth.Validator == "prox5" {
+			p5, err := stealth.NewProx5Pool(cfg.Stealth.USProxies, logger)
+			if err != nil {
+				logger.Printf("prox5 pool: %v (falling back to internal)", err)
+				usProxyPool = stealth.NewUSProxyPool(cfg.Stealth.USProxies, logger)
+			} else {
+				usProxyPool = p5
+			}
+		} else {
+			usProxyPool = stealth.NewUSProxyPool(cfg.Stealth.USProxies, logger)
+		}
 	}
 
 	// ── Dashboard (freebuff-proxy dashboard) ───────────────────────────────
@@ -469,7 +486,7 @@ var (
 	healthCacheTTL = 5 * time.Second
 )
 
-func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[string]any {
+func extraHealth(cfg *config.Config, usProxyPool stealth.ProxyDispenser) map[string]any {
 	// USProxyPool methods dereference internal mutex state; guard the nil
 	// case so /healthz works when the pool is disabled (us_proxies: []).
 	poolSize := 0
@@ -502,7 +519,7 @@ func extraHealth(cfg *config.Config, usProxyPool *stealth.USProxyPool) map[strin
 	return body
 }
 
-func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, lmarenaClient *lmarena.Client, board *lmarena.Leaderboard, usProxyPool *stealth.USProxyPool, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
+func aiStackStatus(cfg *config.Config, hermesClient *hermes.Client, lmarenaClient *lmarena.Client, board *lmarena.Leaderboard, usProxyPool stealth.ProxyDispenser, parallelClient *parallel.Client, webSearcher *websearch.Searcher) map[string]any {
 	proxyBackend := passthroughBackendURL(cfg)
 	return map[string]any{
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
@@ -654,7 +671,7 @@ func parallelStatus(client *parallel.Client, searcher *websearch.Searcher) map[s
 
 // usProxyPoolStatus reports the built-in US SOCKS5 pool state for
 // /ai-stack/status — the gateway's own stealth-egress layer.
-func usProxyPoolStatus(pool *stealth.USProxyPool) map[string]any {
+func usProxyPoolStatus(pool stealth.ProxyDispenser) map[string]any {
 	if pool == nil {
 		return map[string]any{"status": "disabled"}
 	}
@@ -773,7 +790,7 @@ type staticStats struct{ v any }
 
 func (s staticStats) Stats() any { return s.v }
 
-type usProxyStats struct{ pool *stealth.USProxyPool }
+type usProxyStats struct{ pool stealth.ProxyDispenser }
 
 func (s usProxyStats) Stats() any {
 	if s.pool == nil {

@@ -13,6 +13,16 @@ import (
 	"time"
 )
 
+// ProxyDispenser is the seam the gateway programs against: dispense the
+// next validated SOCKS5 URL, report size, hot-swap contents. Implemented
+// by USProxyPool (internal sidecar-probed validation) and Prox5Pool
+// (prox5 engine validation + mid-dial retry).
+type ProxyDispenser interface {
+	Next() *url.URL
+	Size() int
+	Replace(proxyURLs []string) int
+}
+
 // USProxyPool is a round-robin pool of SOCKS5 US proxies from freebuff-unified.
 type USProxyPool struct {
 	mu      sync.RWMutex

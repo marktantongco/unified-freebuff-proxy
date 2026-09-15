@@ -21,7 +21,7 @@ import (
 // handshake path production traffic uses), and hot-swaps the USProxyPool
 // with the alive set.
 type Refresher struct {
-	pool      *USProxyPool
+	pool      ProxyDispenser
 	sidecar   *hermes.Client
 	logger    *log.Logger
 	geofilter string // "us" filters to US egress via ipapi.co country code
@@ -61,7 +61,7 @@ type Refresher struct {
 // Concurrency 2 + ProbeTimeout 8s keeps p95 sidecar latency low so foreground
 // queries don't hit 5m abort; increase via struct fields after construction
 // if a dedicated second hermes on :3102 is used.
-func NewRefresher(pool *USProxyPool, sidecar *hermes.Client, logger *log.Logger) *Refresher {
+func NewRefresher(pool ProxyDispenser, sidecar *hermes.Client, logger *log.Logger) *Refresher {
 	return &Refresher{
 		pool:            pool,
 		sidecar:         sidecar,
