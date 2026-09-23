@@ -17,9 +17,15 @@ import (
 
 // Options holds the external dependencies for the HTTP API server.
 type Options struct {
-	Model       string
+	Model string
+	// ProxyAPIKey is the single client key. Prefer ProxyAPIKeys when the
+	// configuration lists more than one key; this field keeps working for
+	// callers that only ever pass one.
 	ProxyAPIKey string
-	Chat        ChatService
+	// ProxyAPIKeys is the full server.api_keys list. When non-empty, every
+	// entry authenticates (blank entries are ignored).
+	ProxyAPIKeys []string
+	Chat         ChatService
 	TokenPool   PoolStatsProvider
 	ProxyPool   PoolStatsProvider
 	// Hermes, when set, exposes the stealth sidecar endpoints
@@ -105,7 +111,11 @@ func NewApp(opts Options) *fiber.App {
 	handlers.extraHealth = opts.ExtraHealth
 	handlers.aiStack = opts.AIStack
 
-	if opts.ProxyAPIKey != "" {
+	apiKeys := opts.ProxyAPIKeys
+	if len(apiKeys) == 0 && opts.ProxyAPIKey != "" {
+		apiKeys = []string{opts.ProxyAPIKey}
+	}
+	if len(apiKeys) > 0 {
 		app.Use(func(c fiber.Ctx) error {
 			// Health, ai-stack status, and proxy verification endpoints are
 			// always public so monitors can probe them without a key.
@@ -113,7 +123,7 @@ func NewApp(opts Options) *fiber.App {
 				c.Path() == "/ai-stack/status" || c.Path() == "/proxy/verify" {
 				return c.Next()
 			}
-			return authMiddleware(opts.ProxyAPIKey)(c)
+			return authMiddleware(apiKeys)(c)
 		})
 	}
 

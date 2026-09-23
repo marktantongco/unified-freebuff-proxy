@@ -22,8 +22,8 @@ func parallelApp(client *parallel.Client) *fiber.App {
 	h.parallelMode = "fast"
 	app := fiber.New()
 	// Mirror NewApp's auth-gated route registration minimally.
-	app.Post("/v1/parallel/search", authMiddleware("testkey"), h.ParallelSearch)
-	app.Post("/v1/parallel/extract", authMiddleware("testkey"), h.ParallelExtract)
+	app.Post("/v1/parallel/search", authMiddleware([]string{"testkey"}), h.ParallelSearch)
+	app.Post("/v1/parallel/extract", authMiddleware([]string{"testkey"}), h.ParallelExtract)
 	return app
 }
 
@@ -229,7 +229,7 @@ func TestParallelSearch_FallsBackToKeylessStealth(t *testing.T) {
 	h.webSearcher = websearch.New(hermes.New(fakeDDG.URL))
 
 	app := fiber.New()
-	app.Post("/v1/parallel/search", authMiddleware("testkey"), h.ParallelSearch)
+	app.Post("/v1/parallel/search", authMiddleware([]string{"testkey"}), h.ParallelSearch)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/parallel/search",
 		bytes.NewReader(jsonBody(t, map[string]any{"objective": "stealth query"})))
@@ -256,7 +256,7 @@ func TestParallelSearch_NoBackendAtAllReturns503(t *testing.T) {
 	h.parallel = parallel.New("", "")
 	h.webSearcher = nil // no sidecar either
 	app := fiber.New()
-	app.Post("/v1/parallel/search", authMiddleware("testkey"), h.ParallelSearch)
+	app.Post("/v1/parallel/search", authMiddleware([]string{"testkey"}), h.ParallelSearch)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/parallel/search",
 		bytes.NewReader(jsonBody(t, map[string]any{"objective": "q"})))
