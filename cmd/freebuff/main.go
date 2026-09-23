@@ -380,8 +380,10 @@ func runServe(cfg *config.Config, logger *log.Logger) {
 	}
 
 	app := httpapi.NewApp(httpapi.Options{
-		Model:       cfg.Upstream.DefaultModel,
-		ProxyAPIKey: apiKey,
+		Model: cfg.Upstream.DefaultModel,
+		// Every server.api_keys entry authenticates a client; apiKey above
+		// stays the first key, which the passthrough backend expects.
+		ProxyAPIKeys: cfg.Server.APIKeys,
 		Chat:        chatService,
 		TokenPool:   tokenPool,
 		ProxyPool:   usProxyStats{pool: usProxyPool}, Hermes: hermesClient, LMArena: lmarenaClient, EvalStore: evalStore, Leaderboard: board, Parallel: parallelClient,
